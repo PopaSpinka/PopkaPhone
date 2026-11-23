@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Новая вкладка</title>
+<style>
+	/*
+	 * Новая вкладка — «01 ИЗБРАННОЕ» плитками и «02 ЧАСТО» строками (вариант 9 из 10, docs/DESIGN.md
+	 * «Новая вкладка Naomi Web»). Адрес — в строке сверху, её рисует bcdesk. Цвета и мерки — как у панели
+	 * NaomiOS: в скобках — константы bcdesk (src/desk.h), значения у них те же.
+	 */
+	:root {
+		--bg: #0e0f0c;                        /* N_BG */
+		--text: #ece9e3;                      /* N_TEXT */
+		--muted: #a9a49a;                     /* N_MUTED */
+		--dim: #7d786e;                       /* N_DIM */
+		--amber: #d8b25a;                     /* N_AMBER */
+		--line: rgba(216, 178, 90, .16);      /* N_LINE */
+		--hover: rgba(216, 178, 90, .07);     /* N_ITEM_HOVER */
+		--press: rgba(216, 178, 90, .12);     /* N_ITEM_PRESS */
+		--bad: #d9705f;                       /* Theme.bad стола — корзина */
+		--bad-hover: rgba(217, 112, 95, .14); /* DeskStyle.badA(0.14) — под корзиной */
+		--caps: 13px;                         /* N_CAPS */
+		--meta: 13px;                         /* N_META */
+		--plate-h: 18px;                      /* N_PLATE_H */
+		--item-pad: 12px;                     /* N_ITEM_PAD */
+		--item-gap: 2px;                      /* N_ITEM_GAP */
+		--row-h: 40px;                        /* N_ROW_H */
+		--column: 760px;                      /* колонка страницы: 6 плиток в ряд */
+		--tile-w: 124px;
+		--sans: 'NaomiOS Sans', 'Google Sans', 'Open Sans', sans-serif;   /* на телефоне — Google Sans */
+		--mono: 'Adwaita Mono', 'Ubuntu Sans Mono', monospace;              /* на телефоне — Ubuntu Sans Mono */
+	}
+	html, body {
+		margin: 0;
+		min-height: 100%;
+		background: var(--bg);
+		color: var(--text);
+		font: 15px/1.3 var(--sans);
+		-webkit-user-select: none;
+		user-select: none;
+	}
+	main {
+		width: min(var(--column), calc(100% - 64px));
+		margin: 0 auto;
+		padding: 12vh 0 48px;
+	}
+	section + section { margin-top: 40px; }
+
+	/* Шильдик: номер тускло, имя янтарём, линия до края, справа — сколько. */
+	.plate {
+		display: flex;
+		align-items: center;
+		gap: 11px;
+		height: var(--plate-h);
+		margin: 0 0 12px;
+		font: 400 var(--caps) var(--mono);
+		letter-spacing: .2em;
+		text-transform: uppercase;
+		color: var(--amber);
+	}
+	.plate .num, .plate .count { color: var(--dim); letter-spacing: .1em; }
+	.plate .line { flex: 1; min-width: 8px; height: 1px; background: var(--line); }
+
+	/* Плитки и строки — как элементы панели: без рамок, под курсором заливка, нажатая — на пиксель ниже. */
+	.tile, .row {
+		display: flex;
+		align-items: center;
+		border-radius: 2px;
+		cursor: pointer;
+		text-decoration: none;
+		color: inherit;
+	}
+	.tile:hover, .row:hover { background: var(--hover); }
+	.tile:active, .row:active:not(:has(.end:active)) { background: var(--press); transform: translateY(1px); }
+
+	.tiles {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, var(--tile-w));
+		gap: var(--item-gap);
+	}
+	.tile {
+		flex-direction: column;
+		gap: 10px;
+		padding: 16px var(--item-pad) 13px;
+		min-width: 0;
+	}
+	.tile .name {
+		max-width: 100%;
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+		font-size: 14px;
+		color: var(--muted);
+	}
+	.tile:hover .name { color: var(--text); }
+
+	/* «Часто» — строки одного журнала: черта только между строками. */
+	.row {
+		gap: 12px;
+		height: var(--row-h);
+		padding: 0 var(--item-pad);
+	}
+	.row + .row { box-shadow: inset 0 1px var(--line); }
+	.row .title {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+	}
+	/*
+	 * Справа — число заходов; под мышью на месте числа — корзина (своё, НаомиФона): щелчок — сайт забыт, строка
+	 * сворачивается, снизу встаёт следующий. Место под мышь — на всю высоту строки и не уже кнопки.
+	 */
+	.row .end {
+		display: grid;
+		place-items: center end;
+		align-self: stretch;
+		min-width: 22px;
+	}
+	.end > * { grid-area: 1 / 1; }
+	.row .count {
+		font: var(--meta) var(--mono);
+		letter-spacing: .04em;
+		color: var(--dim);
+	}
+	.row .drop {
+		display: none;
+		place-items: center;
+		width: 22px;
+		height: 22px;
+		border-radius: 2px;
+		background: var(--bad-hover);
+		color: var(--bad);
+	}
+	.end:hover .count { visibility: hidden; }
+	.end:hover .drop { display: grid; }
+	.row.gone {
+		height: 0;
+		opacity: 0;
+		overflow: hidden;
+		pointer-events: none;
+		transition: height 160ms cubic-bezier(.215, .61, .355, 1), opacity 160ms cubic-bezier(.215, .61, .355, 1);
+	}
+	img { flex: none; }
+
+	.empty {
+		margin: 0;
+		padding: 0 var(--item-pad);
+		font: var(--meta) var(--mono);
+		letter-spacing: .04em;
+		color: var(--muted);
+	}
+	[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+	<section id="favorites">
+		<h2 class="plate"><span class="num">01</span><span>Избранное</span><span class="line"></span><span class="count" id="fav-count"></span></h2>
+		<nav class="tiles" id="fav-tiles"></nav>
+		<p class="empty" id="fav-empty" hidden>пусто — звёздочка в строке адреса добавляет сайт сюда</p>
+	</section>
+	<section id="frequent" hidden>
+		<h2 class="plate"><span class="num">02</span><span>Часто</span><span class="line"></span></h2>
+		<nav id="freq-rows"></nav>
+	</section>
+</main>
+<script src="newtab.js"></script>
+</body>
+</html>

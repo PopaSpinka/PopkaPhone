@@ -1,0 +1,22 @@
+#!/bin/sh
+# НаомиФон — программа Windows на рабочий стол (docs/WINDOWS.md): Wine через Box64, окно — в композитор оболочки.
+#   winrun программа.exe [аргументы]        # на телефоне (~/naomi/bin/winrun); путь — Windows (C:\…) или Linux
+# Метка NAOMI_DESK_APP=win — по ней оболочка отдаёт окна столу (AppLauncher::deskApp). Стол должны смотреть.
+# Префикс — ~/.local/share/naomi/win/prefix (первый запуск создаёт его сам, ~2,5 мин). Убить всё — winkill.
+W=${NAOMI_WINE:-$HOME/naomi/third/wine-10.0}
+export BOX64_LD_LIBRARY_PATH=$HOME/naomi/win/box64/x64lib BOX64_LOG=${BOX64_LOG:-0} BOX64_NOBANNER=1
+export WINEPREFIX=$HOME/.local/share/naomi/win/prefix WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-mscoree,mshtml=}"
+export WINEDEBUG=${WINEDEBUG:-err+all,fixme-all} XDG_RUNTIME_DIR=/run/user/32011 WAYLAND_DISPLAY=wayland-naomi
+export NAOMI_DESK_APP=win
+# Vulkan: обычный загрузчик (системный — libhybris, драйверы Mesa не грузит) и драйвер видеочипа Turnip (device/wine.sh);
+# вывод кадров — через wl_shm (MESA_VK_WSI_DEBUG=sw): linux-dmabuf у композитора оболочки нет
+export LD_LIBRARY_PATH=$HOME/naomi/win/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export VK_ICD_FILENAMES=$HOME/naomi/win/mesa/share/vulkan/icd.d/freedreno_icd.aarch64.json
+export MESA_VK_WSI_DEBUG=${MESA_VK_WSI_DEBUG-sw}
+# Звук: очередь потока PulseAudio 80 мс вместо 20 — на нагретом телефоне (ядра придушены втрое) поток смешивания Wine
+# не успевал к сроку, и звук шёл частой дрожью («скрежет», 21 ноября 2026)
+export PULSE_LATENCY_MSEC=${PULSE_LATENCY_MSEC:-80}
+# Системная шина D-Bus Wine не нужна: через неё он без конца опрашивал диски у udisksd — тот занимал до целого ядра
+export DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent
+unset DISPLAY
+exec $HOME/naomi/win/box64/box64 $W/bin/wine "$@"

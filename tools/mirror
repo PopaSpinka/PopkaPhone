@@ -1,0 +1,9 @@
+#!/bin/sh
+# НаомиФон Mirror — окно с экраном телефона на Mac (docs/STREAM.md). Electron — свой (mirror/node_modules):
+# один раз `cd mirror && npm install`.
+#   tools/mirror
+set -eu
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ELECTRON="$ROOT/mirror/node_modules/.bin/electron"
+[ -x "$ELECTRON" ] || { echo "нет Electron: сначала cd mirror && npm install" >&2; exit 1; }
+exec "$ELECTRON" "$ROOT/mirror" "$@"

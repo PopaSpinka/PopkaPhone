@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""naomi-usbshare (Pi) — the dock lends its ESP32 boards to the phone over the cable (docs/BOARDS.md).
+
+A board plugged into the Pi goes to the phone as if plugged into the phone: USB/IP, the kernel's own (usbip-host here,
+vhci-hcd on the phone), the standard wire format (version 0x0111: OP_REQ_DEVLIST, OP_REQ_IMPORT). Only boards: USB
+devices on the list below, nothing else of the Pi's (mouse, keyboard, the phone itself). Listens only on the Pi's
+fixed address on the cable (10.77.0.53): the phone is the only one there. Root (sysfs of usbip-host). systemd:
+naomi-usbshare.service (tools/boards install).
+
+    naomi-usbshare            serve (the service)
+    naomi-usbshare list       which boards are here and their state
+    naomi-usbshare release    give every board back to the Pi (its own drivers): the service does it when it stops
+    naomi-usbshare install    /usr/local/sbin/naomi-usbshare + naomi-usbshare.service, started (tools/boards install)
+    naomi-usbshare uninstall
+"""
+import os
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+
+SELF = "/usr/local/sbin/naomi-usbshare"
+UNIT = "/etc/systemd/system/naomi-usbshare.service"
+ADDRESS = os.environ.get("NAOMI_USBSHARE_ADDRESS", "10.77.0.53")
+PORT = 3240
+# (vendor, product or None — any): Espressif's own USB (USB-Serial-JTAG 303a:1001, its TinyUSB ids), WCH CH343 (the
+# P4 and LCD-4B boards' second port). All are CDC-ACM — the phone's driver (cdc-acm.ko) knows them.
+BOARDS = [("303a", None), ("1a86", "55d3")]
+
+DEVICES = "/sys/bus/usb/devices"
+STUB = "/sys/bus/usb/drivers/usbip-host"
+VERSION = 0x0111
+REQ_DEVLIST, REP_DEVLIST = 0x8005, 0x0005
+REQ_IMPORT, REP_IMPORT = 0x8003, 0x0003
+SPEEDS = {"1.5": 1, "12": 2, "480": 3, "53.3-480": 4, "5000": 5, "10000": 6, "20000": 6}
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def write(path, text):
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def boards():
+    """busid -> sysfs folder of every board plugged into the Pi now."""
+    out = {}
+    for name in sorted(os.listdir(DEVICES)):
+        if ":" in name or name.startswith("usb"):
+            continue  # (interfaces, root hubs)
+        d = os.path.join(DEVICES, name)
+        vid, pid = read(f"{d}/idVendor"), read(f"{d}/idProduct")
+        if any(vid == v and (p is None or pid == p) for v, p in BOARDS):
+            out[name] = d
+    return out
+
+
+def driver(d):
+    link = os.path.join(d, "driver")
+    return os.path.basename(os.readlink(link)) if os.path.islink(link) else ""
+
+
+def lend(busid, d):
+    """Bind the board to usbip-host (away from the Pi's cdc_acm). -> its usbip_status: 1 free, 2 in use."""
+    if driver(d) != "usbip-host":
+        write(f"{STUB}/match_busid", f"add {busid}")
+        if driver(d):
+            write(f"{d}/driver/unbind", busid)
+        write(f"{STUB}/bind", busid)
+        log(f"{busid}: lent ({read(d + '/manufacturer')} {read(d + '/product')})")
+    return int(read(f"{d}/usbip_status", "0") or 0)
+
+
+def release_all():
+    for busid, d in boards().items():
+        if driver(d) == "usbip-host":
+            try:
+                write(f"{STUB}/unbind", busid)
+            except OSError:
+                pass
+        try:
+            write(f"{STUB}/match_busid", f"del {busid}")
+        except OSError:
+            pass
+        try:
+            write("/sys/bus/usb/drivers_probe", busid)
+        except OSError:
+            pass
+        log(f"{busid}: back to the Pi ({driver(d) or 'no driver'})")
+
+
+def device_info(busid, d):
+    """usbip_usb_device (312 bytes, network order)."""
+    info = struct.pack(">256s32sIII", d.encode(), busid.encode(), int(read(f"{d}/busnum")), int(read(f"{d}/devnum")),
+                       SPEEDS.get(read(f"{d}/speed"), 0))
+    info += struct.pack(">HHH", int(read(f"{d}/idVendor"), 16), int(read(f"{d}/idProduct"), 16),
+                        int(read(f"{d}/bcdDevice"), 16))
+    info += struct.pack(">BBBBBB", int(read(f"{d}/bDeviceClass"), 16), int(read(f"{d}/bDeviceSubClass"), 16),
+                        int(read(f"{d}/bDeviceProtocol"), 16), int(read(f"{d}/bConfigurationValue") or 0),
+                        int(read(f"{d}/bNumConfigurations")), int(read(f"{d}/bNumInterfaces") or 0))
+    return info
+
+
+def interfaces(d):
+    out = b""
+    base = os.path.basename(d)
+    for name in sorted(os.listdir(d)):
+        if name.startswith(base + ":"):
+            i = os.path.join(d, name)
+            out += struct.pack(">BBBB", int(read(f"{i}/bInterfaceClass"), 16), int(read(f"{i}/bInterfaceSubClass"), 16),
+                               int(read(f"{i}/bInterfaceProtocol"), 16), 0)
+    return out
+
+
+def recv_all(conn, n):
+    buf = b""
+    while len(buf) < n:
+        part = conn.recv(n - len(buf))
+        if not part:
+            raise ConnectionError("closed")
+        buf += part
+    return buf
+
+
+def serve_one(conn, peer):
+    version, code, _ = struct.unpack(">HHI", recv_all(conn, 8))
+    if code == REQ_DEVLIST:
+        free = []
+        for busid, d in boards().items():
+            if lend(busid, d) == 1:
+                free.append((busid, d))
+        body = b"".join(device_info(b, d) + interfaces(d) for b, d in free)
+        conn.sendall(struct.pack(">HHII", VERSION, REP_DEVLIST, 0, len(free)) + body)
+        return False
+    if code == REQ_IMPORT:
+        busid = recv_all(conn, 32).split(b"\0")[0].decode()
+        d = boards().get(busid)
+        if not d or lend(busid, d) != 1:
+            conn.sendall(struct.pack(">HHI", VERSION, REP_IMPORT, 1))
+            log(f"{busid}: refused to {peer[0]} ({'not a board here' if not d else 'in use'})")
+            return False
+        conn.sendall(struct.pack(">HHI", VERSION, REP_IMPORT, 0) + device_info(busid, d))
+        keepalive(conn)
+        write(f"{d}/usbip_sockfd", str(conn.fileno()))  # (the kernel takes the socket; ours closes after)
+        log(f"{busid}: to {peer[0]}")
+        return True
+    log(f"unknown request {code:#06x} from {peer[0]}")
+    return False
+
+
+def keepalive(conn):
+    """The kernel keeps the socket for as long as the board is on the phone: a cable pulled out must end it (else the
+    board stays "in use" here and the phone can't take it again) — ~11 s of silence."""
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5)
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+
+
+def serve():
+    subprocess.run(["modprobe", "usbip-host"], check=True)
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.setsockopt(socket.SOL_IP, 15, 1)  # (IP_FREEBIND: the cable address comes and goes with the phone)
+    srv.bind((ADDRESS, PORT))
+    srv.listen()
+    log(f"listening on {ADDRESS}:{PORT}")
+    signal.signal(signal.SIGTERM, lambda *_: (release_all(), sys.exit(0)))
+    for busid, d in boards().items():
+        lend(busid, d)
+    while True:
+        conn, peer = srv.accept()
+        try:
+            conn.settimeout(5)
+            serve_one(conn, peer)
+        except (OSError, ConnectionError, struct.error, ValueError) as e:
+            log(f"{peer[0]}: {e}")
+        finally:
+            conn.close()
+
+
+def show():
+    for busid, d in boards().items():
+        state = {"1": "free for the phone", "2": "on the phone", "3": "lost"}.get(read(f"{d}/usbip_status"), "")
+        print(busid, f"{read(d + '/idVendor')}:{read(d + '/idProduct')}", read(d + "/product"),
+              read(d + "/serial"), driver(d) or "-", state)
+
+
+def install():
+    shutil.copy(os.path.abspath(__file__), SELF)
+    os.chmod(SELF, 0o755)
+    with open(UNIT, "w") as f:
+        f.write("# NaomiPhone dock: ESP32 boards plugged in here go to the phone over the cable (pi/usbshare, "
+                "docs/BOARDS.md)\n[Unit]\nDescription=NaomiPhone dock: lend ESP32 boards to the phone (USB/IP)\n"
+                "After=network.target\n\n[Service]\nExecStart=/usr/bin/python3 " + SELF + " serve\n"
+                "Restart=always\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n")
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "enable", "-q", "naomi-usbshare"], check=True)
+    subprocess.run(["systemctl", "restart", "naomi-usbshare"], check=True)
+    print("installed: naomi-usbshare (the dock lends its boards to the phone)")
+
+
+def uninstall():
+    subprocess.run(["systemctl", "disable", "-q", "--now", "naomi-usbshare"], check=False)
+    for f in (UNIT, SELF):
+        if os.path.exists(f):
+            os.remove(f)
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    release_all()
+    print("removed: naomi-usbshare")
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
+    {"serve": serve, "list": show, "release": release_all, "install": install, "uninstall": uninstall}[cmd]()

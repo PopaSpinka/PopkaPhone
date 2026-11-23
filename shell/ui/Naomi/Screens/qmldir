@@ -1,0 +1,3 @@
+module Naomi.Screens
+ScreenView 1.0 ScreenView.qml
+Wallpaper 1.0 Wallpaper.qml

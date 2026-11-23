@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""НаомиФон — проверка кабеля USB между телефоном и Raspberry Pi (docs/PI.md, «Кабели»).
+
+  tools/pi-cable имя     телефон воткнут этим кабелем в синий порт USB 3 на Pi: скорость, на которой
+                         договорились USB, сеть по кабелю туда и обратно, задержка, ошибки USB → reports/cable-имя.json
+  tools/pi-cable watch   кабели по очереди: вынь телефон из всего, потом втыкай кабели в Pi один за другим —
+                         каждый проверяется сам (имена 1, 2, 3…), голос Mac говорит, когда менять; Ctrl-C — конец
+  tools/pi-cable         таблица по всем проверенным кабелям
+
+Команды идут мимо кабеля: к Pi — по Ethernet (naomi-pi.local), к телефону — по Wi-Fi (как `tools/naomi`).
+Сеть по кабелю — та же, что для трансляции: телефон 10.77.0.1 (гаджет NCM), Pi получает 10.77.0.x от телефона.
+Скорость сети меряется голым TCP (питон с обеих сторон, приёмник слушает только адрес кабеля).
+"""
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPORTS = os.path.join(ROOT, "reports")
+PI = ["ssh", "-i", os.path.join(ROOT, "private", "ssh", "naomiphone_ed25519"), "-o", "IdentitiesOnly=yes",
+      "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+      "-o", f"UserKnownHostsFile={os.path.join(ROOT, 'private', 'ssh', 'known_hosts_pi')}", "naomi@naomi-pi.local"]
+PHONE_CABLE = "10.77.0.1"
+PORT = 5201
+SECONDS = 8
+
+# приёмник и отправитель: одна программа на обе стороны
+NET = r"""
+import json, socket, sys, time
+role, host, port, secs = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
+if role == "recv":
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, port)); s.listen(1); s.settimeout(30)
+    c, _ = s.accept()
+    buf, n, t0, last, gap, per = bytearray(1 << 20), 0, None, None, 0.0, {}
+    while True:
+        k = c.recv_into(buf)
+        now = time.monotonic()
+        if not k:
+            break
+        if t0 is None:
+            t0 = last = now
+        gap = max(gap, now - last)   # самый долгий перерыв между приходами данных
+        last = now
+        n += k
+        sec = int(now - t0)
+        per[sec] = per.get(sec, 0) + k
+    dt = last - t0
+    rates = [round(per.get(i, 0) * 8 / 1e6) for i in range(int(dt))]   # Мбит/с по целым секундам
+    print(json.dumps({"bytes": n, "seconds": round(dt, 2), "mbit": round(n * 8 / dt / 1e6),
+                      "max_gap_ms": round(gap * 1000), "per_second": rates}))
+else:
+    c = socket.create_connection((host, port), timeout=10)
+    data, end = bytes(1 << 20), time.monotonic() + secs
+    while time.monotonic() < end:
+        c.sendall(data)
+    c.close()
+"""
+
+
+def say(msg):
+    print(f"\033[1;33m» {msg}\033[0m", flush=True)
+
+
+def die(msg):
+    print(f"\033[1;31m✗ {msg}\033[0m", file=sys.stderr)
+    sys.exit(1)
+
+
+def naomi():
+    """tools/naomi как модуль — его путь к телефону (здесь только Wi-Fi: кабель занят Pi)."""
+    os.environ["NAOMI_VIA"] = "wifi"
+    loader = importlib.machinery.SourceFileLoader("naomi", os.path.join(ROOT, "tools", "naomi"))
+    spec = importlib.util.spec_from_loader("naomi", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def sh(argv, cmd, check=True):
+    p = subprocess.run(argv + [cmd], capture_output=True, text=True)
+    if check and p.returncode:
+        die(f"{cmd!r}: {p.stderr.strip() or p.returncode}")
+    return p.stdout.strip()
+
+
+def phone_usb(ph):
+    return dict(zip(("speed", "state"), sh(ph, "cat /sys/class/udc/*/current_speed /sys/class/udc/*/state").split()))
+
+
+def pi_usb():
+    """Телефон в USB Pi (гаджет 18d1:4ee4): скорость в Мбит/с и порт."""
+    out = sh(PI, "for d in /sys/bus/usb/devices/*; do [ \"$(cat $d/idVendor 2>/dev/null):$(cat $d/idProduct 2>/dev/null)\" "
+                 "= 18d1:4ee4 ] && echo $(cat $d/speed) $(basename $d) $(cat $d/version); done; true")
+    return out.split() if out else None
+
+
+def pi_cable_ip():
+    out = sh(PI, "ip -4 -o addr | awk '$4 ~ /^10\\.77\\.0\\./ {print $2, $4}'")
+    return out.split() if out else None
+
+
+def transfer(src, dst, dst_host):
+    """Мбит/с от src к dst: приёмник на dst слушает dst_host."""
+    recv = subprocess.Popen(dst + ["python3", "-", "recv", dst_host, str(PORT), "0"], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    recv.stdin.write(NET)
+    recv.stdin.close()
+    time.sleep(2)
+    subprocess.run(src + ["python3", "-", "send", dst_host, str(PORT), str(SECONDS)], input=NET, text=True,
+                   capture_output=True)
+    out, err = recv.communicate(timeout=60)
+    if recv.returncode:
+        die(f"приёмник: {err.strip()}")
+    return json.loads(out)
+
+
+def check(name, enum_s=None):
+    """enum_s — сколько секунд от «телефон воткнут» до «Pi его видит» (в режиме watch)."""
+    ph = naomi().ssh_argv()
+    say(f"кабель «{name}»: жду телефон в USB Pi")
+    for _ in range(30):
+        usb = pi_usb()
+        if usb:
+            break
+        time.sleep(1)
+    else:
+        die("Pi не видит телефон: кабель только для зарядки, не до конца вставлен или телефон спит?")
+    speed, port, version = usb
+    phone = phone_usb(ph)
+    print(f"  Pi: {speed} Мбит/с (USB{version}, порт {port}); телефон: {phone['speed']}, {phone['state']}")
+    for _ in range(30):
+        ip = pi_cable_ip()
+        if ip:
+            break
+        time.sleep(1)
+    else:
+        die("Pi не получил адрес от телефона по кабелю")
+    iface, pi_ip = ip[0], ip[1].split("/")[0]
+    print(f"  сеть: Pi {iface} {pi_ip} ↔ телефон {PHONE_CABLE}")
+    log0 = int(sh(PI, "sudo dmesg | wc -l"))
+
+    say(f"телефон → Pi, {SECONDS} с (так пойдёт видео)")
+    up = transfer(ph, PI, pi_ip)
+    print(f"  {up['mbit']} Мбит/с ({up['bytes'] / 1e6:.0f} МБ за {up['seconds']} с), по секундам {up['per_second']},"
+          f" самый долгий перерыв {up['max_gap_ms']} мс")
+    say(f"Pi → телефон, {SECONDS} с")
+    down = transfer(PI, ph, PHONE_CABLE)
+    print(f"  {down['mbit']} Мбит/с, по секундам {down['per_second']}, самый долгий перерыв {down['max_gap_ms']} мс")
+    say("задержка: 500 пингов Pi → телефон")
+    ping = sh(PI, f"sudo ping -q -c 500 -i 0.005 {PHONE_CABLE} | tail -2")
+    print("  " + ping.replace("\n", "\n  "))
+    loss = ping.split("received, ")[1].split()[0] if "received, " in ping else "?"
+    # «rtt min/avg/max/mdev = 1.780/2.171/2.422/0.140 ms»
+    rtt = ping.split("=")[-1].split()[0].split("/") if "rtt" in ping else []
+    errors = sh(PI, f"sudo dmesg | tail -n +{log0 + 1} | grep -iE 'usb|ncm|reset|error|disconnect' || true")
+    print(f"  ошибки USB в журнале Pi: {errors or 'нет'}")
+
+    after = pi_usb()
+    result = {"cable": name, "time": time.strftime("%Y-%m-%d %H:%M"), "data": True, "enum_s": enum_s,
+              "pi_speed_mbit": int(speed),
+              "usb_version": version, "pi_port": port, "phone_speed": phone["speed"],
+              "phone_to_pi_mbit": up["mbit"], "pi_to_phone_mbit": down["mbit"],
+              "phone_to_pi_gap_ms": up["max_gap_ms"], "pi_to_phone_gap_ms": down["max_gap_ms"],
+              "phone_to_pi_per_second": up["per_second"], "ping_loss": loss,
+              "ping_ms": dict(zip(("min", "avg", "max", "mdev"), (float(x) for x in rtt))) if rtt else None,
+              "usb_errors": errors.splitlines(), "same_after": after == usb}
+    save(result)
+    print(f"\033[1;32m✓ кабель {name}: USB {'3' if int(speed) >= 5000 else '2'} ({speed} Мбит/с), "
+          f"телефон → Pi {up['mbit']} Мбит/с\033[0m")
+    table()
+
+
+def save(result):
+    os.makedirs(REPORTS, exist_ok=True)
+    with open(os.path.join(REPORTS, f"cable-{result['cable']}.json"), "w") as f:
+        json.dump(result, f, ensure_ascii=False, indent=1)
+
+
+def table():
+    rows = [json.load(open(p)) for p in sorted(glob.glob(os.path.join(REPORTS, "cable-*.json")))]
+    if not rows:
+        print("кабели ещё не проверялись")
+        return
+    print(f"\n{'кабель':<8}{'USB':>8}{'подкл.':>8}{'тел → Pi':>11}{'Pi → тел':>11}{'перерыв':>9}{'пинг ср/макс':>16}"
+          f"{'ошибки':>8}")
+    for r in sorted(rows, key=lambda r: int(r["cable"]) if r["cable"].isdigit() else 0):
+        if not r.get("data", True):
+            print(f"{r['cable']:<8}{'только зарядка (Pi не видит телефон)':>40}")
+            continue
+        p = r["ping_ms"] or {}
+        gap = max(r["phone_to_pi_gap_ms"], r["pi_to_phone_gap_ms"])
+        enum = f"{r['enum_s']} с" if r.get("enum_s") is not None else "—"
+        print(f"{r['cable']:<8}{r['pi_speed_mbit']:>6} M{enum:>8}{r['phone_to_pi_mbit']:>7} Мб/с"
+              f"{r['pi_to_phone_mbit']:>7} Мб/с{gap:>6} мс{p.get('avg', 0):>8.2f}/{p.get('max', 0):<6.2f} мс"
+              f"{len(r['usb_errors']):>5}")
+
+
+def voice(text):
+    subprocess.Popen(["say", "-v", "Milena", text])
+
+
+def plugged(ph):
+    """Воткнут ли телефон куда-нибудь (партнёр Type-C есть — с данными или только зарядка)."""
+    while True:   # SSH по Wi-Fi иногда не отвечает — спросить ещё раз, а не счесть «вынут»
+        p = subprocess.run(ph + ["test -e /sys/class/typec/port0-partner && echo yes || echo no"],
+                           capture_output=True, text=True)
+        if p.stdout.strip() in ("yes", "no"):
+            return p.stdout.strip() == "yes"
+        time.sleep(1)
+
+
+def watch():
+    ph = naomi().ssh_argv()
+    if plugged(ph):
+        say("телефон куда-то воткнут — вынь кабель, и начнём")
+        voice("Вынь кабель из телефона")
+        while plugged(ph):
+            time.sleep(1)
+    n = 1 + len(glob.glob(os.path.join(REPORTS, "cable-*.json")))
+    while True:
+        say(f"втыкай кабель {n}: телефон ↔ синий порт Pi")
+        voice(f"Втыкай кабель {n}")
+        while not plugged(ph):
+            time.sleep(1)
+        # ждать Pi, пока кабель воткнут: бывает, USB встаёт не сразу — и это тоже про кабель
+        t0, told, shown = time.monotonic(), False, 0
+        while not pi_usb():
+            waited = int(time.monotonic() - t0)
+            if waited >= shown + 5 and not told:
+                shown = waited
+                print(f"  жду Pi: {waited} с", flush=True)
+            if not plugged(ph):
+                say(f"кабель {n} вынули, а Pi телефона так и не увидел")
+                break
+            if waited >= 20 and not told:
+                say(f"кабель {n}: {waited} с, Pi телефона не видит — похоже, только для зарядки")
+                voice(f"Кабель {n}: данных нет. Меняй")
+                save({"cable": str(n), "time": time.strftime("%Y-%m-%d %H:%M"), "data": False})
+                told = True
+            time.sleep(1)
+        else:
+            enum_s = round(time.monotonic() - t0)
+            if told:
+                say(f"кабель {n}: Pi увидел телефон через {enum_s} с — всё-таки с данными, проверяю")
+            voice(f"Кабель {n} подключён, проверяю")
+            try:
+                check(str(n), enum_s)
+                voice(f"Кабель {n} готов. Меняй")
+            except (SystemExit, Exception) as e:
+                say(f"кабель {n}: проверка не удалась — {e}")
+                voice(f"Кабель {n}: проверка не удалась. Меняй")
+        while plugged(ph):
+            time.sleep(1)
+        n += 1
+
+
+def main():
+    if len(sys.argv) == 1:
+        table()
+    elif sys.argv[1:] == ["watch"]:
+        try:
+            watch()
+        except KeyboardInterrupt:
+            table()
+    elif len(sys.argv) == 2:
+        check(sys.argv[1])
+    else:
+        die(__doc__)
+
+
+if __name__ == "__main__":
+    main()

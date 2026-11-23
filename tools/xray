@@ -1,0 +1,849 @@
+#!/usr/bin/env python3
+"""НаомиФон — «рентген» телефона (docs/XRAY.md): запись трассы ядра и снимков /proc на N секунд и разбор — кто
+сколько работал, на каких ядрах, сколько ждал своей очереди и за кем, что его блокировало, прерывания, частоты, сон
+ядер, видеочип по процессам, память, тепло, мощность, сеть.
+
+  tools/xray run [сек] [имя] [idle] [-- команда …]   запись (10 с) и разбор → reports/xray-ДАТА-имя/report.txt;
+                                    команда после «--» запускается на Mac через 1 с после начала записи (сценарий:
+                                    tools/naomi mouse …, tools/deskbench …); idle — писать и засыпания ядер
+  tools/xray again ПАПКА [слово …]  разобрать записанное снова; слова — какие потоки считать главными (см. FOCUS)
+  tools/xray step ПАПКА [шаг | С ПО]  только отрезок записи: шаг сценария (запись из tools/deskbench; без шага —
+                                    список шагов) или секунды от начала записи
+  tools/xray compare A B            сравнить две записи: ядра, главные потоки, ожидания
+  tools/xray thread ПАПКА СЛОВО     один поток подробно: куски работы, где ждал, за кем, что блокировало
+  tools/xray trap [сек] [-- команда …]  «ловушка»: где поток интерфейса оболочки засыпает не по своей воле (диск,
+                                    замок, память) — стек ядра каждого такого засыпания, сводка по причинам. Пишет
+                                    только этот поток: не мешает и не переполняется (device/uitrap.sh)
+  tools/xray disk [сек] [-- команда …]  задержка диска «со стороны стола»: чтение 4 КБ мимо кэша раз в 20 мс
+                                    (device/ioprobe.py) — середина, 95 %, 99 %, худшее
+                                    (у обеих: без команды — сек секунд (30); с командой — пока она работает)
+
+Телефон только пишет (device/xray.py), разбор — здесь. Часы трассы — CLOCK_MONOTONIC телефона, как у трассы стола
+(зонд /probe) и журнала оболочки (-o short-monotonic): записи можно сводить по времени.
+"""
+import collections
+import gzip
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PHONE_DIR = "/tmp/xray"
+# Потоки, от которых зависит плавность: для них — подробный разбор ожиданий
+FOCUS = r"naomi|QSG|QQml|Qt|venc|Venus|Chrome|Compositor|Viz|CrGpu|CrRenderer|pulse|waydroid|surfacefl|composer|" \
+        r"allocator|RenderThread|HwBinder|binder:|kgsl|vidc|crtc|sde|wlan|cds_|dwc3|usb|ncm"
+LINE = re.compile(r"^\s*(.+)-(\d+)\s+\(\s*([-\d]+)\)\s+\[(\d+)\]\s+(\S+)\s+(\d+\.\d+):\s+(\w+):\s?(.*)$")
+SWITCH = re.compile(r"prev_comm=(.*) prev_pid=(\d+) prev_prio=(\d+) prev_state=(\S+) ==> next_comm=(.*) "
+                    r"next_pid=(\d+) next_prio=(\d+)")
+WAKE = re.compile(r"comm=(.*) pid=(\d+) prio=(\d+) target_cpu=(\d+)")
+KV = re.compile(r"(\w+)=(\S+)")
+
+
+def load(name):
+    loader = importlib.machinery.SourceFileLoader(name, os.path.join(ROOT, "tools", name))
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def pct(v, q):
+    if not v:
+        return 0.0
+    v = sorted(v)
+    return v[min(len(v) - 1, int(len(v) * q))]
+
+
+# ───────────────────────── запись ─────────────────────────
+
+def record(secs, name, extra, command):
+    os.environ.setdefault("NAOMI_VIA", "wifi")   # кабель телефона обычно у приставки
+    naomi = load("naomi")
+    out = os.path.join(ROOT, "reports", f"xray-{time.strftime('%Y%m%d-%H%M%S')}" + (f"-{name}" if name else ""))
+    os.makedirs(out)
+    naomi.push(os.path.join(ROOT, "device", "xray.py"), "/home/phablet/naomi/bin/xray.py")
+    side = None
+    if command:
+        def run_side():
+            time.sleep(1.0)
+            with open(os.path.join(out, "command.log"), "w") as log:
+                log.write(" ".join(command) + "\n")
+                log.flush()
+                subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT)
+        side = threading.Thread(target=run_side)
+        side.start()
+    p = subprocess.run(naomi.ssh_argv(f"sudo -n rm -rf {PHONE_DIR}; sudo -n python3 ~/naomi/bin/xray.py {secs} "
+                                      f"{PHONE_DIR} {' '.join(extra)}"), capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.exit(f"запись не удалась: {p.stderr.strip() or p.stdout.strip()}")
+    if side:
+        side.join()
+    tar = subprocess.Popen(naomi.ssh_argv(f"tar -C {PHONE_DIR} -cf - ."), stdout=subprocess.PIPE)
+    subprocess.run(["tar", "-C", out, "-xf", "-"], stdin=tar.stdout, check=True)
+    tar.wait()
+    subprocess.run(naomi.ssh_argv(f"sudo -n rm -rf {PHONE_DIR}"), capture_output=True)
+    return out
+
+
+# ───────────────────────── разбор трассы ─────────────────────────
+
+class Trace:
+    """Всё, что вынуто из трассы: по потокам, ядрам, прерываниям, видеочипу."""
+
+    def __init__(self, folder, focus=FOCUS, keep=None, window=None, title=""):
+        self.folder = folder
+        self.window = window       # (с, по) в секундах часов телефона — разбирать только этот отрезок (шаг сценария)
+        self.title = title
+        with open(os.path.join(folder, "state.json")) as f:
+            self.state = json.load(f)
+        self.focus = re.compile(focus)
+        self.keep = keep           # tid, для которого хранить все куски (tools/xray thread)
+        self.slices = []           # (с, по, ядро) — только для keep
+        cap = self.state["static"]["capacity"]
+        self.ncpu = len(cap)
+        self.cap = [cap[f"cpu{i}"] for i in range(self.ncpu)]
+        top, low = max(self.cap), min(self.cap)
+        self.kind = ["м" if c == low else ("г" if c == top else "б") for c in self.cap]   # малое, большое, главное
+        self.name, self.tgid = {}, {}
+        for snap in ("a", "b"):
+            for tid, t in self.state[snap]["threads"].items():
+                self.name[int(tid)] = t["comm"]
+                self.tgid[int(tid)] = t["pid"]
+        self.run = collections.defaultdict(lambda: [0.0] * self.ncpu)
+        self.nslice = collections.Counter()
+        self.mig = collections.Counter()
+        self.wake_lat = collections.defaultdict(list)     # tid → [с] от пробуждения до ядра
+        self.preempt = collections.defaultdict(float)     # tid → с вытеснен (готов работать, а ядро отняли)
+        self.npreempt = collections.Counter()
+        self.blocked = collections.defaultdict(lambda: collections.defaultdict(lambda: [0, 0.0, 0.0]))
+        self.waits = []                                   # (длилось, когда, tid, вид, ядро, за кем)
+        self.steal = collections.defaultdict(lambda: collections.defaultdict(float))   # tid → кто → с
+        self.wakers = collections.defaultdict(collections.Counter)
+        self.irq = collections.defaultdict(lambda: {"n": 0, "t": 0.0, "max": 0.0, "cpu": collections.Counter()})
+        self.soft = collections.defaultdict(lambda: {"n": 0, "t": 0.0, "max": 0.0, "cpu": collections.Counter()})
+        self.irq_cpu = [0.0] * self.ncpu
+        self.freq_changes = collections.Counter()
+        self.limits = []
+        self.gpu_ctx = {}                                  # ctx → tgid
+        self.gpu_time = collections.defaultdict(float)     # tgid → с видеочипа
+        self.gpu_jobs = collections.Counter()
+        self.gpu_state = collections.defaultdict(float)
+        self.gpu_levels = collections.Counter()
+        self.vidc = collections.Counter()
+        self.cdev = []
+        self.marks = []
+        self.t0 = self.t1 = None
+        self.cpu_last = [None] * self.ncpu                 # последнее событие ядра (переполнился буфер — ядро замолкает)
+        self.lines = 0
+        self.parse()
+
+    def label(self, tid):
+        """«процесс/поток» для потока."""
+        n = self.name.get(tid, "?")
+        pid = self.tgid.get(tid)
+        if pid and pid != tid:
+            return f"{self.proc_name(pid)}/{n}"
+        return self.proc_name(tid) if pid == tid else n
+
+    def proc_name(self, pid):
+        t = self.state["b"]["threads"].get(str(pid)) or self.state["a"]["threads"].get(str(pid))
+        if not t:
+            return self.name.get(pid, str(pid))
+        cmd = t["cmd"].split()
+        base = os.path.basename(cmd[0]) if cmd else ""
+        # у служб Android имя главного потока — «binder:…», «main»: полезнее имя программы
+        if base and (t["comm"].startswith(("binder:", "main", "HwBinder")) or t["comm"] in ("sh", "python3")):
+            return base[:24]
+        return t["comm"]
+
+    def parse(self):
+        ncpu = self.ncpu
+        cur = [None] * ncpu          # (tid, с какого времени)
+        wake_at = {}                 # tid → (когда, ядро, кто его занимал)
+        pre_at = {}                  # tid → (когда, кто вытеснил)
+        out_at = {}                  # tid → когда ушёл спать
+        irq_in = [None] * ncpu
+        soft_in = [None] * ncpu
+        gpu_sub = {}
+        gpu_state, gpu_since = None, None
+        run, name, tgid = self.run, self.name, self.tgid
+        keep = self.keep
+        wa, wb = self.window or (float("-inf"), float("inf"))
+
+        def clip(s0, e0):
+            return max(0.0, min(e0, wb) - max(s0, wa))
+        with gzip.open(os.path.join(self.folder, "trace.gz"), "rt", errors="replace") as f:
+            for line in f:
+                m = LINE.match(line)
+                if not m:
+                    continue
+                self.lines += 1
+                comm, tid, tg, cpu, flags, ts, ev, rest = m.groups()
+                tid, cpu, ts = int(tid), int(cpu), float(ts)
+                if self.t0 is None:
+                    self.t0 = ts
+                if ts > wb:
+                    break
+                self.t1 = ts
+                self.cpu_last[cpu] = ts
+                inw = ts >= wa
+                if tg[0] != "-" and tid:
+                    tgid.setdefault(tid, int(tg))
+                if ev == "sched_switch":
+                    s = SWITCH.match(rest)
+                    if not s:
+                        continue
+                    pc, pp, _, pstate, nc, np_, _ = s.groups()
+                    pp, np_ = int(pp), int(np_)
+                    name[pp] = pc
+                    name[np_] = nc
+                    c = cur[cpu]
+                    if c and c[0] == pp:
+                        run[pp][cpu] += clip(c[1], ts)
+                        if keep == pp and inw:
+                            self.slices.append((c[1], ts, cpu))
+                    elif c is None:
+                        run[pp][cpu] += clip(self.t0, ts)
+                    if inw:
+                        self.nslice[pp] += 1
+                    if pp:
+                        if pstate[0] == "R":
+                            pre_at[pp] = (ts, np_)
+                            if inw:
+                                self.npreempt[pp] += 1
+                        else:
+                            out_at[pp] = ts
+                    cur[cpu] = (np_, ts)
+                    if np_ and not inw:
+                        wake_at.pop(np_, None)
+                        pre_at.pop(np_, None)
+                    elif np_:
+                        w = wake_at.pop(np_, None)
+                        if w:
+                            d = ts - w[0]
+                            self.wake_lat[np_].append(d)
+                            if d >= 0.002:
+                                self.waits.append((d, w[0], np_, "после пробуждения", cpu, w[2]))
+                            if d >= 0.0005 and w[2]:
+                                self.steal[np_][w[2]] += d
+                        p = pre_at.pop(np_, None)
+                        if p:
+                            d = ts - p[0]
+                            self.preempt[np_] += d
+                            if d >= 0.002:
+                                self.waits.append((d, p[0], np_, "вытеснен", cpu, p[1]))
+                            self.steal[np_][p[1]] += d
+                elif ev in ("sched_wakeup", "sched_wakeup_new"):
+                    w = WAKE.match(rest)
+                    if not w:
+                        continue
+                    wc, wp, _, tc = w.groups()
+                    wp, tc = int(wp), int(tc)
+                    name[wp] = wc
+                    if wp not in wake_at and wp not in pre_at:
+                        occ = cur[tc][0] if tc < ncpu and cur[tc] else 0
+                        wake_at[wp] = (ts, tc, occ)
+                        if tid and flags[2] == ".":
+                            self.wakers[wp][tid] += 1
+                elif not inw:
+                    if ev == "adreno_cmdbatch_queued":
+                        self.gpu_ctx[dict(KV.findall(rest)).get("ctx")] = tgid.get(tid, tid)
+                    elif ev == "kgsl_pwr_set_state":
+                        gpu_state, gpu_since = rest[rest.find("state=") + 6:].strip(), wa
+                    elif ev == "irq_handler_entry" or ev == "softirq_entry":
+                        irq_in[cpu] = soft_in[cpu] = None
+                elif ev == "sched_migrate_task":
+                    k = dict(KV.findall(rest))
+                    self.mig[int(k.get("pid", 0))] += 1
+                elif ev == "sched_blocked_reason":
+                    k = dict(KV.findall(rest))
+                    p = int(k.get("pid", 0))
+                    since = out_at.get(p)
+                    if since is not None:
+                        rec = self.blocked[p][k.get("caller", "?").split("+")[0] + (" (диск)" if k.get("iowait") == "1" else "")]
+                        d = ts - since
+                        rec[0] += 1
+                        rec[1] += d
+                        rec[2] = max(rec[2], d)
+                elif ev == "irq_handler_entry":
+                    k = dict(KV.findall(rest))
+                    irq_in[cpu] = (ts, f"{k.get('name', '?')} [{k.get('irq')}]")
+                elif ev == "irq_handler_exit":
+                    if irq_in[cpu]:
+                        d = ts - irq_in[cpu][0]
+                        r = self.irq[irq_in[cpu][1]]
+                        r["n"] += 1
+                        r["t"] += d
+                        r["max"] = max(r["max"], d)
+                        r["cpu"][cpu] += 1
+                        self.irq_cpu[cpu] += d
+                        irq_in[cpu] = None
+                elif ev == "softirq_entry":
+                    soft_in[cpu] = (ts, rest[rest.find("action=") + 7:].rstrip("]"))
+                elif ev == "softirq_exit":
+                    if soft_in[cpu]:
+                        d = ts - soft_in[cpu][0]
+                        r = self.soft[soft_in[cpu][1]]
+                        r["n"] += 1
+                        r["t"] += d
+                        r["max"] = max(r["max"], d)
+                        r["cpu"][cpu] += 1
+                        self.irq_cpu[cpu] += d
+                        soft_in[cpu] = None
+                elif ev == "cpu_frequency":
+                    k = dict(KV.findall(rest))
+                    self.freq_changes[int(k.get("cpu_id", 0))] += 1
+                elif ev in ("cpu_frequency_limits", "dcvsh_freq"):
+                    self.limits.append((ts, ev, rest.strip()))
+                elif ev == "adreno_cmdbatch_queued":
+                    k = dict(KV.findall(rest))
+                    self.gpu_ctx[k.get("ctx")] = tgid.get(tid, tid)
+                elif ev == "adreno_cmdbatch_submitted":
+                    k = dict(KV.findall(rest))
+                    gpu_sub[(k.get("ctx"), k.get("ts"))] = ts
+                elif ev == "adreno_cmdbatch_retired":
+                    k = dict(KV.findall(rest))
+                    s0 = gpu_sub.pop((k.get("ctx"), k.get("ts")), None)
+                    owner = self.gpu_ctx.get(k.get("ctx"), f"ctx{k.get('ctx')}")
+                    self.gpu_jobs[owner] += 1
+                    if s0 is not None:
+                        self.gpu_time[owner] += ts - s0
+                elif ev == "kgsl_pwr_set_state":
+                    st = rest[rest.find("state=") + 6:].strip()
+                    if gpu_state:
+                        self.gpu_state[gpu_state] += ts - gpu_since
+                    gpu_state, gpu_since = st, ts
+                elif ev == "kgsl_pwrlevel":
+                    k = dict(KV.findall(rest))
+                    self.gpu_levels[k.get("freq", k.get("pwrlevel", "?"))] += 1
+                elif ev.startswith("msm_v4l2_vidc"):
+                    self.vidc[ev] += 1
+                elif ev == "cdev_update":
+                    self.cdev.append((ts, rest.strip()))
+                elif ev == "tracing_mark_write":
+                    self.marks.append((ts, rest.strip()))
+        if self.t0 is None:
+            sys.exit("трасса пустая")
+        if self.t1 is None:
+            self.t1 = self.t0
+        self.base = max(self.t0, wa)
+        end = min(self.t1, wb) if self.window else self.t1
+        for cpu in range(ncpu):
+            c = cur[cpu]
+            if c:
+                run[c[0]][cpu] += max(0.0, end - max(c[1], self.base))
+            else:   # ядро за всю запись ни разу не переключилось — спало
+                run[0][cpu] += max(0.0, end - self.base)
+        if gpu_state:
+            self.gpu_state[gpu_state] += max(0.0, end - max(gpu_since, self.base))
+        self.dur = max(1e-6, end - self.base)
+
+    # ───────── сводки ─────────
+
+    def cpu_busy(self):
+        """Занятость ядер по трассе: всё, кроме потока простоя."""
+        busy = [0.0] * self.ncpu
+        for tid, per in self.run.items():
+            if tid:
+                for c in range(self.ncpu):
+                    busy[c] += per[c]
+        return [b / self.dur for b in busy]
+
+    def thread_rows(self):
+        rows = []
+        th_b = self.state["b"]["threads"]
+        th_a = self.state["a"]["threads"]
+        for tid, per in self.run.items():
+            if not tid:
+                continue
+            total = sum(per)
+            by = {"м": 0.0, "б": 0.0, "г": 0.0}
+            for c in range(self.ncpu):
+                by[self.kind[c]] += per[c]
+            info = th_b.get(str(tid)) or th_a.get(str(tid)) or {}
+            lat = self.wake_lat.get(tid, [])
+            rows.append({
+                "tid": tid, "pid": self.tgid.get(tid, tid), "label": self.label(tid), "ms": total * 1e3,
+                "little": by["м"] * 1e3, "big": by["б"] * 1e3, "prime": by["г"] * 1e3,
+                "slices": self.nslice[tid], "mig": self.mig[tid],
+                "lat50": pct(lat, 0.5) * 1e3, "lat95": pct(lat, 0.95) * 1e3, "latmax": max(lat, default=0) * 1e3,
+                "wakes": len(lat), "preempt": self.preempt.get(tid, 0) * 1e3, "npreempt": self.npreempt[tid],
+                "blocked": sum(r[1] for r in self.blocked.get(tid, {}).values()) * 1e3,
+                "nice": info.get("nice"), "policy": info.get("policy", 0), "rtprio": info.get("rtprio", 0),
+                "stune": info.get("stune", ""), "allowed": info.get("allowed", ""),
+            })
+        rows.sort(key=lambda r: -r["ms"])
+        return rows
+
+    def proc_rows(self, rows):
+        procs = {}
+        for r in rows:
+            p = procs.setdefault(r["pid"], {"pid": r["pid"], "name": self.proc_name(r["pid"]), "ms": 0, "little": 0,
+                                            "big": 0, "prime": 0, "threads": 0, "preempt": 0})
+            for k in ("ms", "little", "big", "prime", "preempt"):
+                p[k] += r[k]
+            p["threads"] += 1
+        return sorted(procs.values(), key=lambda p: -p["ms"])
+
+
+# ───────────────────────── отчёт ─────────────────────────
+
+def sched_class(r):
+    if r["policy"] == 1:
+        return f"FIFO{r['rtprio']}"
+    if r["policy"] == 2:
+        return f"RR{r['rtprio']}"
+    if r["policy"] == 3:
+        return "batch"
+    if r["policy"] == 5:
+        return "idle"
+    return f"{r['nice']:+d}" if r["nice"] else "0" if r["nice"] is not None else "?"
+
+
+def watts(p):
+    return p["usb_uv"] * p["usb_ua"] / 1e12, p["bat_uv"] * p["bat_ua"] / 1e12
+
+
+def report(tr, save=True):
+    """Полный отчёт; для отрезка (шаг сценария) — только то, что берётся из трассы: снимки /proc сняты по краям
+    всей записи и к отрезку не относятся."""
+    whole = tr.window is None
+    st, a, b = tr.state, tr.state["a"], tr.state["b"]
+    dur = tr.dur
+    L = []
+    w = L.append
+    rows = tr.thread_rows()
+    procs = tr.proc_rows(rows)
+    busy = tr.cpu_busy()
+    hz = st["static"]["hz"]
+
+    w(f"РЕНТГЕН ТЕЛЕФОНА — {os.path.basename(tr.folder)}" + (f" — {tr.title}" if tr.title else ""))
+    w((f"запись {dur:.2f} с" if whole else f"отрезок {dur:.2f} с (с {tr.base:.3f} по часам телефона)") +
+      f", событий ядра {tr.lines}, работает {st['static']['uptime'] / 60:.0f} мин; "
+      f"потоков {len(b['threads'])}, процессов {len({t['pid'] for t in b['threads'].values()})}")
+    # Буфер ядра не перезаписывается: переполнился — ядро до конца записи молчит, и потоков на нём с этого места
+    # не видно («работал» превращается в «ждал»). Отрезку, задевшему такое молчание, верить нельзя
+    lost = {int(c[3:]): sum(int(l.split(":")[1]) for l in v if l.startswith(("overrun", "dropped")))
+            for c, v in st["buffers"].items()}
+    lost = {c: n for c, n in sorted(lost.items()) if n}
+    blind = [c for c in lost if tr.cpu_last[c] is None or tr.t1 - tr.cpu_last[c] > 0.2]
+    summary_lost = {"lost": {f"cpu{c}": n for c, n in lost.items()}, "blind": [f"cpu{c}" for c in blind]}
+    if lost:
+        w("  ВНИМАНИЕ: буфер трассы переполнился, потеряно событий: " + ", ".join(
+            f"ядро {c} — {n}" + (f" (молчит с {tr.cpu_last[c] - tr.t0:.1f} с записи)" if c in blind and
+                                 tr.cpu_last[c] is not None else "") for c, n in lost.items()))
+        w("  " + (f"ЭТОМУ ОТЧЁТУ НЕ ВЕРИТЬ: с этого места потоков на ядрах {', '.join(map(str, blind))} не видно — доли по "
+                  f"ядрам, ожидания и «кто отнял ядро» неверны. Запись короче или шаг раньше" if blind else
+                  "этот отрезок цел: потери — после него"))
+    if st["missing_events"]:
+        w(f"  ВНИМАНИЕ: нет событий в ядре: {st['missing_events']}")
+    ua, ub = watts(a["power"]), watts(b["power"])
+    if whole:
+        w(f"питание: от кабеля {ua[0]:.2f} → {ub[0]:.2f} Вт, батарея {ua[1]:+.2f} → {ub[1]:+.2f} Вт "
+          f"(плюс — заряжается), заряд {b['power']['bat_pct']} %, батарея {b['power']['bat_temp'] / 10:.1f} °C")
+    summary = {"dur": dur, "power_usb": ub[0], "power_bat": ub[1], **summary_lost}
+
+    # ── ядра
+    w("")
+    w("ЯДРА  (м — малое A55, б — большое A76, г — главное A76)")
+    w("  ядро вид  занято  прерывания  смен частоты  сон: состояния (доля времени)      разрешено от–до, МГц")
+    pol_of = {}
+    for pname, pol in b["cpus"]["freq"].items():
+        for c in pol["cpus"].split():
+            pol_of[int(c)] = pname
+    for c in range(tr.ncpu):
+        ia, ib = a["cpus"]["idle"].get(f"cpu{c}", {}), b["cpus"]["idle"].get(f"cpu{c}", {})
+        idle = " ".join(f"{n} {100 * (ib[n][1] - ia.get(n, [0, 0])[1]) / 1e6 / dur:3.0f}%" for n in ib) if whole else "—"
+        pol = b["cpus"]["freq"].get(pol_of.get(c, ""), {})
+        w(f"  {c}    {tr.kind[c]}   {100 * busy[c]:5.1f}%   {100 * tr.irq_cpu[c] / dur:5.2f}%      "
+          f"{tr.freq_changes[c]:5d}       {idle:34s} {pol.get('min', 0) // 1000}–{pol.get('max', 0) // 1000}")
+    summary["busy"] = busy
+    w(f"  всего занято {sum(busy) * 100:.0f}% одного ядра "
+      f"(малые {sum(busy[c] for c in range(tr.ncpu) if tr.kind[c] == 'м') * 100:.0f}%, "
+      f"большое {sum(busy[c] for c in range(tr.ncpu) if tr.kind[c] == 'б') * 100:.0f}%, "
+      f"главное {sum(busy[c] for c in range(tr.ncpu) if tr.kind[c] == 'г') * 100:.0f}%)")
+    if whole:
+        w("  частоты (доля времени записи):")
+    for pname, pol in sorted(b["cpus"]["freq"].items()) if whole else []:
+        pa = a["cpus"]["freq"][pname]
+        d = {f: pol["time_in_state"][f] - pa["time_in_state"].get(f, 0) for f in pol["time_in_state"]}
+        tot = sum(d.values()) or 1
+        top = sorted(((v, f) for f, v in d.items() if v), reverse=True)[:6]
+        w(f"    ядра {pol['cpus']:12s} {pol['gov']:10s} " +
+          ", ".join(f"{int(f) // 1000} МГц {100 * v / tot:.0f}%" for v, f in top))
+    stune = st["static"]["stune"]
+    w("  группы планировщика (schedtune): " + "; ".join(
+        f"{n or 'общая'}: подъём {g['boost']}, большие ядра {g['prefer_high_cap']}, свободное ядро {g['prefer_idle']}"
+        for n, g in sorted(stune.items())))
+
+    # ── процессы
+    w("")
+    w("ПРОЦЕССЫ  (время на ядрах за запись; 100% = одно ядро занято целиком)")
+    w("  процесс                    pid   потоков    мс    %ядра   на малых  большом  главном   вытеснен мс")
+    for p in procs[:22 if whole else 12]:
+        if p["ms"] < 1:
+            break
+        tot = p["ms"] or 1
+        w(f"  {p['name'][:24]:24s} {p['pid']:6d}  {p['threads']:4d}  {p['ms']:8.0f}  {p['ms'] / dur / 10:5.1f}%   "
+          f"{100 * p['little'] / tot:5.0f}%   {100 * p['big'] / tot:5.0f}%   {100 * p['prime'] / tot:5.0f}%   {p['preempt']:8.1f}")
+    summary["procs"] = {f"{p['name']}": p["ms"] for p in procs[:40]}
+
+    # ── потоки
+    w("")
+    w("ПОТОКИ  (ожидание — от пробуждения до ядра; вытеснен — был готов работать, а ядро отняли; блок — спал в ядре не по своей воле: замок, диск, память)")
+    w("  процесс/поток                          tid  класс  группа    мс   %ядра  мал  бол  гл  кусков переездов  ожидание мс p50/p95/макс  вытеснен  блок мс")
+    for r in rows[:45 if whole else 22]:
+        if r["ms"] < 0.5:
+            break
+        tot = r["ms"] or 1
+        w(f"  {r['label'][:36]:36s} {r['tid']:6d} {sched_class(r):>6s} {r['stune'][:7]:7s} {r['ms']:7.0f} {r['ms'] / dur / 10:5.1f}% "
+          f"{100 * r['little'] / tot:4.0f} {100 * r['big'] / tot:4.0f} {100 * r['prime'] / tot:3.0f} {r['slices']:7d} {r['mig']:6d}   "
+          f"{r['lat50']:6.2f}/{r['lat95']:6.2f}/{r['latmax']:6.2f}   {r['preempt']:7.1f} {r['blocked']:8.1f}")
+    summary["threads"] = {r["label"]: {k: r[k] for k in ("ms", "little", "big", "prime", "lat95", "latmax", "preempt",
+                                                             "blocked", "mig")} for r in rows[:80]}
+
+    # ── главные потоки: ожидания
+    focus = [r for r in rows if tr.focus.search(r["label"]) and r["ms"] >= 1]
+    w("")
+    w("КТО ОТНИМАЛ ЯДРО У ГЛАВНЫХ ПОТОКОВ  (суммарное ожидание и за кем стояли)")
+    for r in sorted(focus, key=lambda r: -(r["preempt"] + sum(tr.wake_lat.get(r["tid"], [])) * 1e3))[:14]:
+        waited = r["preempt"] + sum(tr.wake_lat.get(r["tid"], [])) * 1e3
+        if waited < 1:
+            break
+        who = sorted(tr.steal[r["tid"]].items(), key=lambda x: -x[1])[:4]
+        w(f"  {r['label'][:36]:36s} ждал {waited:7.1f} мс ({100 * waited / (r['ms'] + waited):3.0f}% от работы+ожидания): " +
+          ", ".join(f"{tr.label(t)[:26]} {d * 1e3:.1f}" for t, d in who))
+    w("")
+    w("ХУДШИЕ ОЖИДАНИЯ ГЛАВНЫХ ПОТОКОВ  (≥ 2 мс)")
+    worst = sorted((x for x in tr.waits if tr.focus.search(tr.label(x[2]))), reverse=True)[:22]
+    for d, t, tid, kind, cpu, occ in worst:
+        w(f"  {t - tr.base:7.3f} с  {tr.label(tid)[:34]:34s} {d * 1e3:6.1f} мс {kind:18s} ядро {cpu}{tr.kind[cpu]}  "
+          f"за: {tr.label(occ) if occ else 'ядро просыпалось'}")
+    if not worst:
+        w("  нет")
+    summary["waits_over_2ms"] = len([x for x in tr.waits if tr.focus.search(tr.label(x[2]))])
+    summary["waits_over_8ms"] = len([x for x in tr.waits if x[0] >= 0.008 and tr.focus.search(tr.label(x[2]))])
+    w("")
+    w("ЧТО БЛОКИРОВАЛО ГЛАВНЫЕ ПОТОКИ В ЯДРЕ  (сон не по своей воле: функция ядра, раз, всего мс, худший мс)")
+    n = 0
+    for r in sorted(focus, key=lambda r: -r["blocked"])[:10]:
+        if r["blocked"] < 1:
+            break
+        top = sorted(tr.blocked[r["tid"]].items(), key=lambda x: -x[1][1])[:4]
+        w(f"  {r['label'][:36]:36s} " + "; ".join(f"{fn} ×{v[0]} {v[1] * 1e3:.1f} (худш. {v[2] * 1e3:.1f})" for fn, v in top))
+        n += 1
+    if not n:
+        w("  нет")
+
+    # ── прерывания
+    w("")
+    w("ПРЕРЫВАНИЯ  (по времени обработчика)")
+    w("  прерывание                              раз/с   всего мс  средн мкс  макс мкс  ядра (раз)            куда разрешено")
+    aff = b["interrupts"]["affinity"]
+    for nm, r in sorted(tr.irq.items(), key=lambda x: -x[1]["t"])[:16]:
+        num = nm[nm.rfind("[") + 1:-1]
+        cp = " ".join(f"{c}:{n_}" for c, n_ in sorted(r["cpu"].items()))
+        w(f"  {nm[:38]:38s} {r['n'] / dur:7.0f}  {r['t'] * 1e3:8.1f}  {r['t'] / r['n'] * 1e6:8.0f}  {r['max'] * 1e6:8.0f}  {cp[:22]:22s} {aff.get(num, '')}")
+    w("  отложенные (softirq): " + "; ".join(
+        f"{nm} {r['n'] / dur:.0f}/с {r['t'] * 1e3:.1f} мс (макс {r['max'] * 1e6:.0f} мкс)"
+        for nm, r in sorted(tr.soft.items(), key=lambda x: -x[1]["t"])[:7]))
+    summary["irq_ms"] = sum(r["t"] for r in tr.irq.values()) * 1e3
+    summary["softirq_ms"] = sum(r["t"] for r in tr.soft.values()) * 1e3
+
+    # ── видеочип
+    w("")
+    g = b["gpu"]
+    w(f"ВИДЕОЧИП  сейчас {g['clk'] // 1000000} МГц, разрешено {g['min_mhz']}–{g['max_mhz']} МГц, {g['gov']}, "
+      f"засыпает через {g['idle_timer']} мс, тепловой уровень {g['thermal_level']}")
+    if tr.gpu_state:
+        w("  состояния: " + ", ".join(f"{s_} {100 * d / dur:.0f}%" for s_, d in sorted(tr.gpu_state.items(), key=lambda x: -x[1])))
+    if tr.gpu_levels:
+        w("  смены уровня: " + ", ".join(f"{k}×{v}" for k, v in tr.gpu_levels.most_common(6)))
+    for owner, t in sorted(tr.gpu_time.items(), key=lambda x: -x[1])[:8]:
+        nm = tr.proc_name(owner) if isinstance(owner, int) else owner
+        w(f"  {nm[:28]:28s} заданий {tr.gpu_jobs[owner]:5d} ({tr.gpu_jobs[owner] / dur:5.1f}/с), видеочип занят им {t * 1e3:7.0f} мс "
+          f"({100 * t / dur:4.1f}%), в среднем {t / max(1, tr.gpu_jobs[owner]) * 1e3:.2f} мс на задание")
+    summary["gpu_ms"] = sum(tr.gpu_time.values()) * 1e3
+    if tr.vidc:
+        w("  кодер/декодер Venus: буферов " + ", ".join(f"{k.replace('msm_v4l2_vidc_buffer_event_', '')} {v}" for k, v in tr.vidc.items()))
+
+    if not whole:
+        text = "\n".join(L) + "\n"
+        if save:
+            with open(os.path.join(tr.folder, f"report-{tr.title or 'отрезок'}.txt"), "w") as f:
+                f.write(text)
+        return text
+
+    # ── тепло
+    w("")
+    w("ТЕПЛО")
+    za, zb = a["thermal"]["zones"], b["thermal"]["zones"]
+    hot = sorted(((v, k) for k, v in zb.items() if 1000 < v < 150000), reverse=True)[:10]
+    w("  самые горячие: " + ", ".join(f"{k} {v / 1000:.1f}" + (f" ({(v - za[k]) / 1000:+.1f})" if abs(v - za.get(k, v)) >= 500 else "")
+                                       for v, k in hot))
+    for key in ("skin-therm-usr", "skin-therm", "quiet-therm-usr", "xo-therm-usr", "battery"):
+        if key in zb:
+            w(f"  {key}: {zb[key] / 1000:.1f} °C")
+    on = [f"{k} {v[0]}/{v[1]}" for k, v in b["thermal"]["cooling"].items() if v[0]]
+    w("  ограничители включены: " + (", ".join(on) if on else "нет"))
+    if tr.limits:
+        w(f"  событий ограничения частоты: {len(tr.limits)}; последние: " + " | ".join(x[2] for x in tr.limits[-3:]))
+    summary["hot"] = hot[0][0] / 1000 if hot else 0
+    summary["cooling_on"] = on
+
+    # ── память
+    w("")
+    mi = b["memory"]["meminfo"]
+    w(f"ПАМЯТЬ  всего {mi['MemTotal'] // 1024} МБ, доступно {mi['MemAvailable'] // 1024} МБ, свободно {mi['MemFree'] // 1024} МБ, "
+      f"кэш файлов {mi.get('Cached', 0) // 1024} МБ, ядро (slab) {mi.get('Slab', 0) // 1024} МБ, ION {b['memory'].get('ion') or '?'} КБ")
+    va, vb = a["memory"]["vmstat"], b["memory"]["vmstat"]
+    w(f"  за запись: отказов страниц {vb['pgfault'] - va['pgfault']} (с диска {vb['pgmajfault'] - va['pgmajfault']}), "
+      f"прямых чисток {vb.get('allocstall', 0) - va.get('allocstall', 0)}, "
+      f"чтение {(vb['pgpgin'] - va['pgpgin']) // 1024} МБ, запись {(vb['pgpgout'] - va['pgpgout']) // 1024} МБ")
+    pss = b.get("pss", {})
+    by_name = collections.defaultdict(lambda: [0, 0, 0])
+    for pid, rec in pss.items():
+        k = by_name[tr.proc_name(int(pid))]
+        k[0] += rec.get("Pss", 0)
+        k[1] += rec.get("Pss_Anon", rec.get("Private_Dirty", 0))
+        k[2] += 1
+    w(f"  по программам (PSS — честная доля, всего {sum(v[0] for v in by_name.values()) // 1024} МБ):")
+    for nm, v in sorted(by_name.items(), key=lambda x: -x[1][0])[:18]:
+        w(f"    {nm[:28]:28s} {v[0] / 1024:7.1f} МБ  (своя, не файлы: {v[1] / 1024:6.1f})" + (f"  ×{v[2]}" if v[2] > 1 else ""))
+    summary["pss_mb"] = {nm: v[0] / 1024 for nm, v in sorted(by_name.items(), key=lambda x: -x[1][0])[:30]}
+    summary["mem_available_mb"] = mi["MemAvailable"] // 1024
+
+    # ── сеть и диск
+    w("")
+    w("СЕТЬ И ДИСК")
+    for nm, d in sorted(b["net"]["dev"].items()):
+        d0 = a["net"]["dev"].get(nm, d)
+        rx, tx = d["rx"] - d0["rx"], d["tx"] - d0["tx"]
+        if rx + tx > 2000:
+            w(f"  {nm:12s} отдано {tx * 8 / dur / 1e6:7.2f} Мбит/с ({(d['tx_pk'] - d0['tx_pk']) / dur:.0f} пак/с), "
+              f"принято {rx * 8 / dur / 1e6:7.2f} Мбит/с ({(d['rx_pk'] - d0['rx_pk']) / dur:.0f} пак/с), "
+              f"потеряно {d['tx_drop'] - d0['tx_drop']}/{d['rx_drop'] - d0['rx_drop']}")
+    ta, tb = a["net"]["tcp"], b["net"]["tcp"]
+    if tb:
+        w(f"  TCP: повторов {tb['RetransSegs'] - ta['RetransSegs']} из {tb['OutSegs'] - ta['OutSegs']} отправленных")
+        summary["tcp_retrans"] = tb["RetransSegs"] - ta["RetransSegs"]
+    for nm, d in sorted(b["disk"].items()):
+        d0 = a["disk"].get(nm, d)
+        if d["rd"] - d0["rd"] + d["wr"] - d0["wr"]:
+            w(f"  диск {nm}: чтений {d['rd'] - d0['rd']}, записей {d['wr'] - d0['wr']} "
+              f"({(d['wr_sect'] - d0['wr_sect']) // 2} КБ), занят {d['io_ms'] - d0['io_ms']} мс")
+    psi = b["memory"]["psi"]
+    if any(psi.values()):
+        w("  давление (PSI): " + "; ".join(f"{k}: {v.splitlines()[0]}" for k, v in psi.items() if v))
+
+    # ── новые и ушедшие потоки, сверка
+    born = [t for t in b["threads"] if t not in a["threads"]]
+    gone = [t for t in a["threads"] if t not in b["threads"]]
+    w("")
+    w(f"за запись родилось потоков {len(born)}, завершилось {len(gone)}" +
+      (": " + ", ".join(sorted({b['threads'][t]['comm'] for t in born})[:12]) if born else ""))
+    ticks = sum((t["utime"] + t["stime"]) - (a["threads"].get(k, {}).get("utime", 0) + a["threads"].get(k, {}).get("stime", 0))
+                for k, t in b["threads"].items() if k in a["threads"])
+    w(f"сверка: по трассе занято {sum(busy) * dur:.2f} с, по счётчикам /proc — {ticks / hz:.2f} с "
+      f"(снимки чуть шире трассы и включают сам рентген)")
+
+    text = "\n".join(L) + "\n"
+    if save:
+        with open(os.path.join(tr.folder, "report.txt"), "w") as f:
+            f.write(text)
+        with open(os.path.join(tr.folder, "summary.json"), "w") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=1)
+    return text
+
+
+# ───────────────────────── ловушка и диск ─────────────────────────
+
+def around(start, stop, secs, command):
+    """start на телефоне → ждать секунды или команду на Mac → stop; ответ — вывод stop."""
+    os.environ.setdefault("NAOMI_VIA", "wifi")
+    naomi = load("naomi")
+    for f in ("uitrap.sh", "ioprobe.py"):
+        naomi.push(os.path.join(ROOT, "device", f), f"/home/phablet/naomi/bin/{f}")
+    p = subprocess.run(naomi.ssh_argv(start), capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.exit(f"не началось: {p.stderr.strip() or p.stdout.strip()}")
+    if command:
+        subprocess.run(command, cwd=ROOT)
+    else:
+        time.sleep(secs)
+    return subprocess.run(naomi.ssh_argv(stop), capture_output=True, text=True, errors="replace").stdout
+
+
+def trap(secs, command):
+    text = around("sudo -n sh ~/naomi/bin/uitrap.sh start",
+                  "sudo -n sh ~/naomi/bin/uitrap.sh stop /tmp/naomi-trap.txt; cat /tmp/naomi-trap.txt", secs, command)
+    out = os.path.join(ROOT, "reports", f"trap-{time.strftime('%Y%m%d-%H%M%S')}.txt")
+    with open(out, "w") as f:
+        f.write(text)
+    when = re.compile(r"\s(\d+\.\d+): (\w+):")
+    switch = re.compile(r"prev_pid=(\d+) .*prev_state=(\S+) ==> .*next_pid=(\d+)")
+    ui, cur, rows = None, None, []
+    for line in text.splitlines():
+        m = when.search(line)
+        if m and m.group(2) == "sched_switch":
+            s = switch.search(line)
+            if not s:
+                continue
+            if ui is None and "prev_comm=naomi-shell" in line:
+                ui = s.group(1)
+            if s.group(1) == ui and s.group(2).startswith("D"):
+                cur = {"t": float(m.group(1)), "stack": [], "why": ""}
+            elif s.group(3) == ui and cur:
+                cur["dur"] = float(m.group(1)) - cur["t"]
+                rows.append(cur)
+                cur = None
+        elif m and m.group(2) == "sched_blocked_reason" and cur:
+            cur["why"] = line.split("caller=")[-1].split("+")[0] + (" (диск)" if "iowait=1" in line else "")
+        elif line.strip().startswith("=>") and cur is not None:
+            cur["stack"].append(line.strip()[3:].split("+")[0].strip())
+    print(f"поток интерфейса оболочки: засыпаний не по своей воле {len(rows)}, всего "
+          f"{sum(r['dur'] for r in rows) * 1e3:.0f} мс; от 8 мс — {len([r for r in rows if r['dur'] >= 0.008])}")
+    by = collections.defaultdict(lambda: [0, 0.0, 0.0])
+    for r in rows:   # первые два кадра стека — сама запись события и планировщик
+        k = by[(r["why"] or "?") + " ← " + " ← ".join(r["stack"][2:9])]
+        k[0] += 1
+        k[1] += r["dur"]
+        k[2] = max(k[2], r["dur"])
+    for k, v in sorted(by.items(), key=lambda x: -x[1][1])[:14]:
+        print(f"  ×{v[0]:<4d} {v[1] * 1e3:7.1f} мс (худш. {v[2] * 1e3:5.1f})  {k}")
+    print("самые долгие (секунда по часам телефона — как в трассе стола):")
+    for r in sorted(rows, key=lambda r: -r["dur"])[:5]:
+        print(f"  {r['dur'] * 1e3:6.1f} мс в {r['t']:.3f}: " + " ← ".join(r["stack"][2:18]))
+    print(f"→ {os.path.relpath(out, ROOT)}")
+
+
+def disk(secs, command):
+    # номер процесса — в файл: pkill по имени убил бы и саму команду SSH (имя есть в её строке)
+    text = around("(sudo -n setsid nohup sh -c 'echo $$ > /tmp/naomi-ioprobe.pid; exec python3 "
+                  f"/home/phablet/naomi/bin/ioprobe.py {3600 if command else secs + 2} /tmp/naomi-ioprobe.txt' "
+                  ">/dev/null 2>&1 < /dev/null &); sleep 0.5",
+                  "sudo -n kill $(cat /tmp/naomi-ioprobe.pid) 2>/dev/null; sleep 0.3; cat /tmp/naomi-ioprobe.txt",
+                  secs, command)
+    lat = sorted(int(l.split()[1]) / 1e3 for l in text.splitlines() if len(l.split()) == 2)
+    if not lat:
+        sys.exit("проб нет")
+    print(f"чтение с диска 4 КБ мимо кэша, проб {len(lat)}: середина {pct(lat, .5):.1f} мс, 95 % {pct(lat, .95):.1f}, "
+          f"99 % {pct(lat, .99):.1f}, худшее {lat[-1]:.0f} мс; дольше 10 мс — {sum(1 for x in lat if x > 10)}, "
+          f"дольше 30 мс — {sum(1 for x in lat if x > 30)}")
+
+
+def steps_of(folder):
+    """Шаги сценария (tools/deskbench пишет steps.json: имя, начало и конец по часам телефона)."""
+    p = os.path.join(folder, "steps.json")
+    return json.load(open(p)) if os.path.exists(p) else []
+
+
+def thread_detail(folder, word):
+    tr = Trace(folder)
+    cand = [r for r in tr.thread_rows() if word.lower() in r["label"].lower() or word == str(r["tid"])]
+    if not cand:
+        sys.exit(f"нет потока со словом «{word}»")
+    r = cand[0]
+    tr = Trace(folder, keep=r["tid"])
+    tid = r["tid"]
+    print(f"{r['label']} (tid {tid}), класс {sched_class(r)}, группа «{r['stune']}», разрешённые ядра {r['allowed']}")
+    print(f"работал {r['ms']:.1f} мс ({r['ms'] / tr.dur / 10:.1f}% ядра), кусков {r['slices']}, переездов {r['mig']}")
+    per = tr.run[tid]
+    print("по ядрам, мс: " + " ".join(f"{c}{tr.kind[c]}:{per[c] * 1e3:.0f}" for c in range(tr.ncpu)))
+    sl = sorted(e - s for s, e, _ in tr.slices)
+    if sl:
+        print(f"кусок работы: p50 {pct(sl, .5) * 1e3:.2f}, p95 {pct(sl, .95) * 1e3:.2f}, макс {sl[-1] * 1e3:.2f} мс")
+    lat = tr.wake_lat.get(tid, [])
+    print(f"ожидание после пробуждения: {len(lat)} раз, p50 {pct(lat, .5) * 1e3:.3f}, p95 {pct(lat, .95) * 1e3:.3f}, "
+          f"p99 {pct(lat, .99) * 1e3:.3f}, макс {max(lat, default=0) * 1e3:.3f} мс; вытеснен {r['npreempt']} раз на {r['preempt']:.1f} мс")
+    print("за кем стоял: " + ", ".join(f"{tr.label(t)} {d * 1e3:.1f} мс" for t, d in
+                                        sorted(tr.steal[tid].items(), key=lambda x: -x[1])[:10]))
+    print("кто будил: " + ", ".join(f"{tr.label(t)} ×{n}" for t, n in tr.wakers[tid].most_common(10)))
+    print("блокировки в ядре: " + ("; ".join(f"{fn} ×{v[0]} {v[1] * 1e3:.1f} мс (худш. {v[2] * 1e3:.1f})" for fn, v in
+                                            sorted(tr.blocked[tid].items(), key=lambda x: -x[1][1])[:10]) or "нет"))
+    print("худшие ожидания:")
+    for d, t, _, kind, cpu, occ in sorted((x for x in tr.waits if x[2] == tid), reverse=True)[:15]:
+        print(f"  {t - tr.t0:7.3f} с {d * 1e3:6.1f} мс {kind:18s} ядро {cpu}{tr.kind[cpu]} за: {tr.label(occ) if occ else 'ядро просыпалось'}")
+
+
+def compare(fa, fb):
+    def s(folder):
+        p = os.path.join(folder, "summary.json")
+        if not os.path.exists(p):
+            report(Trace(folder))
+        with open(p) as f:
+            return json.load(f)
+    A, B = s(fa), s(fb)
+    print(f"было: {os.path.basename(fa.rstrip('/'))} ({A['dur']:.1f} с) → стало: {os.path.basename(fb.rstrip('/'))} ({B['dur']:.1f} с)")
+    print(f"занято ядер, % одного: {sum(A['busy']) * 100:.0f} → {sum(B['busy']) * 100:.0f}; "
+          f"кабель {A['power_usb']:.2f} → {B['power_usb']:.2f} Вт; горячее всего {A['hot']:.1f} → {B['hot']:.1f} °C")
+    print(f"ожиданий главных потоков ≥ 2 мс: {A['waits_over_2ms']} → {B['waits_over_2ms']}; ≥ 8 мс: {A['waits_over_8ms']} → {B['waits_over_8ms']}")
+    print(f"видеочип занят, мс/с: {A['gpu_ms'] / A['dur']:.0f} → {B['gpu_ms'] / B['dur']:.0f}; "
+          f"прерывания, мс/с: {(A['irq_ms'] + A['softirq_ms']) / A['dur']:.1f} → {(B['irq_ms'] + B['softirq_ms']) / B['dur']:.1f}")
+    print("поток                                  мс/с было → стало   на малых %      ожидание p95 мс    вытеснен мс/с")
+    names = sorted(set(A["threads"]) | set(B["threads"]),
+                   key=lambda n: -max(A["threads"].get(n, {}).get("ms", 0) / A["dur"], B["threads"].get(n, {}).get("ms", 0) / B["dur"]))
+    z = {"ms": 0, "little": 0, "lat95": 0, "preempt": 0}
+    for n in names[:30]:
+        x, y = A["threads"].get(n, z), B["threads"].get(n, z)
+        print(f"  {n[:36]:36s} {x['ms'] / A['dur']:6.0f} → {y['ms'] / B['dur']:6.0f}     "
+              f"{100 * x['little'] / (x['ms'] or 1):3.0f} → {100 * y['little'] / (y['ms'] or 1):3.0f}     "
+              f"{x['lat95']:6.2f} → {y['lat95']:6.2f}    {x['preempt'] / A['dur']:6.1f} → {y['preempt'] / B['dur']:6.1f}")
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help", "help"):
+        sys.exit(__doc__)
+    if a[0] == "run":
+        rest = a[1:]
+        command = []
+        if "--" in rest:
+            i = rest.index("--")
+            rest, command = rest[:i], rest[i + 1:]
+        secs = next((x for x in rest if x.replace(".", "").isdigit()), "10")
+        extra = [x for x in rest if x == "idle"]
+        name = next((x for x in rest if x != secs and x != "idle"), "")
+        out = record(float(secs), name, extra, command)
+        print(report(Trace(out)))
+        print(f"→ {os.path.relpath(out, ROOT)}/report.txt")
+    elif a[0] == "again" and len(a) >= 2:
+        focus = "|".join(a[2:]) or FOCUS
+        print(report(Trace(a[1].rstrip("/"), focus)))
+    elif a[0] == "step" and len(a) >= 2:
+        folder = a[1].rstrip("/")
+        steps = steps_of(folder)
+        if len(a) == 2:
+            for s_ in steps:
+                print(f"  {s_['name']:24s} {s_['t1'] - s_['t0']:6.1f} с")
+        elif len(a) == 4:
+            t0 = json.load(open(os.path.join(folder, "state.json")))["t0"]
+            print(report(Trace(folder, window=(t0 + float(a[2]), t0 + float(a[3])), title=f"{a[2]}–{a[3]} с")))
+        else:
+            hit = [s_ for s_ in steps if s_["name"] == a[2]] or [s_ for s_ in steps if a[2] in s_["name"]]
+            if not hit:
+                sys.exit(f"нет шага «{a[2]}»: " + ", ".join(s_["name"] for s_ in steps))
+            for s_ in hit:
+                print(report(Trace(folder, window=(s_["t0"], s_["t1"]), title=s_["name"])))
+    elif a[0] in ("trap", "disk"):
+        rest, command = a[1:], []
+        if "--" in rest:
+            i = rest.index("--")
+            rest, command = rest[:i], rest[i + 1:]
+        (trap if a[0] == "trap" else disk)(float(rest[0]) if rest else 30.0, command)
+    elif a[0] == "compare" and len(a) == 3:
+        compare(a[1], a[2])
+    elif a[0] == "thread" and len(a) == 3:
+        thread_detail(a[1].rstrip("/"), a[2])
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""НаомиФон — замер попадания по клавиатуре (docs/KEYBOARD.md, «Попадание»).
+
+  tools/kbtaps start                 записывать касания на телефоне (device/taprec.py, до 20 мин)
+  tools/kbtaps stop [имя]            остановить, забрать → reports/keyboard/<имя>.jsonl и разобрать
+  tools/kbtaps analyze ФАЙЛ [--phrase "…"] [--times 3] [--no-lift]   (--no-lift: записано до подъёма точки)
+
+Пока идёт запись, человек печатает фразу (по умолчанию «привет как дела еще не родила», трижды, каждую с
+точкой: «123», «.», пробел) в программе — клавиатура там у низа экрана. Разбор: касание → клавиша по
+раскладке (размеры — из shell/ui/Naomi/Ui/Keyboard.qml) → выравнивание с фразой → промахи, куда смещён палец
+по рядам, сколько промахов дал бы сдвиг точки вверх на разные величины и сколько их сейчас (touchLift).
+"""
+import json
+import os
+import re
+import statistics as st
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+NAOMI = os.path.join(ROOT, "tools", "naomi")
+PHONE = "/home/phablet/naomi"
+SCREEN_W, SCREEN_H = 1080, 2340.25          # пиксели панели; логический экран 393 × 851 при плотности 2,75
+PHRASE = "привет как дела еще не родила"
+
+
+def qml_number(src, name):
+    m = re.search(rf"property real {name}: ([\d.]+) \* s", src)
+    if not m:
+        sys.exit(f"нет {name} в Keyboard.qml")
+    return float(m.group(1))
+
+
+class Layout:
+    """Русская раскладка как в Keyboard.qml, в пикселях панели; клавиатура — у низа экрана (KeyboardPanel)."""
+    def __init__(self):
+        src = open(os.path.join(ROOT, "shell", "ui", "Naomi", "Ui", "Keyboard.qml")).read()
+        s = SCREEN_W / 1125
+        self.key_gap = qml_number(src, "keyGap") * s
+        self.key_h = qml_number(src, "keyH") * s
+        self.row_gap = qml_number(src, "gap") * s
+        top_pad = qml_number(src, "topPad") * s
+        self.lift = qml_number(src, "touchLift") * s
+        below = float(re.search(r"implicitHeight: keysBottom \+ ([\d.]+) \* s", src).group(1)) * s
+        keys_bottom = top_pad + 4 * self.key_h + 3 * self.row_gap
+        self.row0 = SCREEN_H - keys_bottom - below + top_pad
+        self.pitch = self.key_h + self.row_gap
+        unit = (SCREEN_W + self.key_gap) / 11
+        rows = [list("йцукенгшщзх"), list("фывапролджэ"), ["shift"] + list("ячсмитьбю") + ["bksp"]]
+        self.keys = []
+        for r, row in enumerate(rows):
+            x = (SCREEN_W - len(row) * unit) / 2
+            for k in row:
+                self.keys.append((k, r, x, unit))
+                x += unit
+        x = (SCREEN_W - 11 * unit) / 2
+        for k, w in (("mode", 2.75), ("space", 5.5), ("enter", 2.75)):
+            self.keys.append((k, 3, x, w * unit))
+            x += w * unit
+        self.row_of = {k: r for k, r, _, _ in self.keys}
+        self.center = {k: (x + w / 2, self.row0 + r * self.pitch + self.key_h / 2) for k, r, x, w in self.keys}
+
+    def key_at(self, x, y):   # как keyAt в Keyboard.qml: промежутки делятся между соседями
+        row = max(0, min(3, int((y - self.row0 + self.row_gap / 2) // self.pitch)))
+        best = None
+        for k, r, kx, _ in self.keys:
+            if r == row and (best is None or x >= kx):
+                best = k
+        return best
+
+    def margin(self, key, y):   # от точки до ближней границы ряда нужной клавиши; минус — вне ряда
+        top = self.row0 + self.row_of[key] * self.pitch - self.row_gap / 2
+        return min(y - top, top + self.pitch - y)
+
+
+def align(want, got, same):
+    n, m = len(want), len(got)
+    d = [[i + j if i == 0 or j == 0 else 0 for j in range(m + 1)] for i in range(n + 1)]
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (0 if same(want[i - 1], got[j - 1]) else 1))
+    i, j, pairs = n, m, []
+    while i and j:
+        if d[i][j] == d[i - 1][j - 1] + (0 if same(want[i - 1], got[j - 1]) else 1):
+            pairs.append((want[i - 1], j - 1)); i -= 1; j -= 1
+        elif d[i][j] == d[i - 1][j] + 1:
+            i -= 1
+        else:
+            j -= 1
+    return pairs[::-1]
+
+
+def analyze(path, phrase=PHRASE, times=3, use_lift=True):
+    lay = Layout()
+    taps, last = [], [None, None, None]
+    for line in open(path):
+        t = json.loads(line)
+        for p in t["pts"]:      # в первых записях (до слотов в taprec.py) пустая ось — та же, что была
+            for k in (1, 2):
+                p[k] = last[k] if p[k] is None else p[k]
+                last[k] = p[k]
+        x, y = t["pts"][-1][1], t["pts"][-1][2]     # клавиша решается по точке отпускания
+        if y > lay.row0 - 60:
+            x0, y0 = t["pts"][0][1], t["pts"][0][2]
+            taps.append({"x": x, "y": y, "move": ((x - x0) ** 2 + (y - y0) ** 2) ** 0.5,
+                         "ms": (t["up"] - t["down"]) * 1000})
+    want = []
+    for _ in range(times):
+        want += ["space" if c == " " else c for c in phrase] + ["mode", "dot", "space"]
+    lift = lay.lift if use_lift else 0      # с какой поправкой печатала клавиатура во время записи
+    got = [lay.key_at(t["x"], t["y"] - lift) for t in taps]
+    pairs = [(w, taps[j]) for w, j in align(want, got, lambda a, b: a == b or (a == "dot" and lay.row_of.get(b) == 2))
+             if w in lay.center]
+    letters = [(w, t) for w, t in pairs if len(w) == 1]
+    print(f"касаний по клавиатуре {len(taps)}, ждали {len(want)}; сопоставлено {len(pairs)}, из них букв {len(letters)}")
+    print(f"размеры (пиксели панели): клавиша {lay.pitch - lay.row_gap:.0f} в высоту, шаг рядов {lay.pitch:.1f}, "
+          f"верх первого ряда {lay.row0:.0f}; клавиатура печатала с подъёмом точки {lift:.0f}")
+    for title, up in (("без поправки", 0), (f"с подъёмом {lift:.0f}", lift)) if lift else (("без поправки", 0),):
+        miss = [(w, t) for w, t in pairs if lay.key_at(t["x"], t["y"] - up) != w]
+        print(f"промахов {title}: {len(miss)} из {len(pairs)}")
+        for w, t in miss:
+            cx, cy = lay.center[w]
+            print(f"  «{w}» → «{lay.key_at(t['x'], t['y'] - up)}»: ({t['x']}, {t['y']}), "
+                  f"от центра dx {t['x'] - cx:+.0f}, dy {t['y'] - cy:+.0f}")
+    for r in range(4):
+        dy = [t["y"] - lay.center[w][1] for w, t in pairs if lay.row_of[w] == r]
+        dx = [t["x"] - lay.center[w][0] for w, t in pairs if lay.row_of[w] == r]
+        if dy:
+            print(f"  ряд {r}: {len(dy)} касаний, ниже центра на {st.median(dy):+.0f}, правее на {st.median(dx):+.0f} (медианы)")
+    print(f"палец за касание сдвигается на {st.median(t['move'] for _, t in letters):.0f} px (медиана), "
+          f"касание длится {st.median(t['ms'] for _, t in letters):.0f} мс")
+    for side, cond in (("левая половина", lambda x: x < SCREEN_W / 2), ("правая половина", lambda x: x >= SCREEN_W / 2)):
+        dx = [t["x"] - lay.center[w][0] for w, t in letters if cond(lay.center[w][0])]
+        if dx:
+            print(f"  {side}: {len(dx)} букв, правее центра на {st.median(dx):+.0f} (медиана)")
+    print("подъём точки → промахов, запас до границы ряда у 95 % касаний:")
+    for lift in sorted({0, 10, 20, 25, 30, 35, 40, 50, round(lay.lift)}):
+        bad = sum(1 for w, t in pairs if lay.key_at(t["x"], t["y"] - lift) != w)
+        m = sorted(lay.margin(w, t["y"] - lift) for w, t in pairs)
+        now = "  ← сейчас" if lift == round(lay.lift) else ""
+        print(f"  {lift:2d} px: {bad} промахов, запас {m[int(len(m) * 0.05)]:.0f} px{now}")
+
+
+def naomi(*args, capture=False):
+    return subprocess.run([NAOMI, *args], check=True, text=True,
+                          stdout=subprocess.PIPE if capture else None).stdout
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "start":
+        src = open(os.path.join(ROOT, "device", "taprec.py")).read()
+        subprocess.run([NAOMI, "ssh", f"cat > {PHONE}/bin/taprec.py"], input=src, text=True, check=True)
+        naomi("ssh", f"rm -f /tmp/taprec.stop /tmp/taprec.jsonl; (nohup python3 {PHONE}/bin/taprec.py "
+                     f"/tmp/taprec.jsonl 1200 >/dev/null 2>&1 &)")
+        print(f"запись идёт (до 20 мин). Напечатать трижды: «{PHRASE.capitalize()}.», потом tools/kbtaps stop")
+    elif cmd == "stop":
+        name = sys.argv[2] if len(sys.argv) > 2 else "taps"
+        naomi("ssh", "touch /tmp/taprec.stop; sleep 1")
+        os.makedirs(os.path.join(ROOT, "reports", "keyboard"), exist_ok=True)
+        path = os.path.join(ROOT, "reports", "keyboard", name + ".jsonl")
+        open(path, "w").write(naomi("ssh", "cat /tmp/taprec.jsonl", capture=True))
+        print(path)
+        analyze(path)
+    elif cmd == "analyze" and len(sys.argv) > 2:
+        args = sys.argv[3:]
+        phrase = args[args.index("--phrase") + 1] if "--phrase" in args else PHRASE
+        times = int(args[args.index("--times") + 1]) if "--times" in args else 3
+        analyze(sys.argv[2], phrase.lower(), times, "--no-lift" not in args)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""НаомиФон — замер плавности приставки на Pi (docs/PI.md, «Плавность»): проверочная мышь на Pi проигрывает сценарий,
+приёмник пишет время каждого кадра (NAOMI_DOCK_TRACE), здесь — разбор: где пропуски и откуда.
+
+  tools/pi-smooth [сценарий[@частота] …]    по умолчанию: cursor@125 drag@125 drag@60 scroll@60
+      cursor   — курсор кругами по столу (кадры — только от наведения)
+      drag     — окно браузера за заголовок туда-обратно ~6 с, ~500 пикселей экрана в секунду, размах — до края стола
+      scroll   — колесо над статьёй: 15 щелчков вниз, 10 в секунду, и обратно
+      thumb    — ползунок прокрутки страницы (справа вверху окна браузера; страница — в самом верху): вниз на трёх
+                 скоростях — 1, 2 и 4 единицы мыши за отчёт (при 62,5 Гц ≈ 62, 125, 250 пикселей экрана в секунду),
+                 по 1,5 с, и так же вверх; разбор — по картинке, на сколько сдвинулась страница за обновление
+      @частота — отчётов мыши в секунду (у мыши пользователя ~60)
+  tools/pi-smooth --again папка …          разобрать снова записанное (reports/smooth-*)
+  PI_ENV="K=V …" tools/pi-smooth …         приёмнику — своё окружение (сравнить: NAOMI_DOCK_ENCFPS=75 и т. п.)
+
+Точки сценариев — по окну браузера на столе: его место (в точках стола) — из ~/.config/naomi/desktop/web.conf
+телефона, размер стола — из NAOMI_DOCK_DESK в PI_ENV (иначе 1600x900, как у приёмника на мониторе 16:9): заголовок — пустое место правее вкладок,
+страница — середина окна. Браузер должен быть открыт. Пока идёт замер, служба naomi-dock остановлена; в конце —
+снова. Заодно — нагрузка телефона (procfs, kgsl, термодатчики) и его строки о трансляции (видеочип, кодер).
+Разбор (время Pi — CLOCK_MONOTONIC; время телефона переводится по сдвигу часов из пингов):
+  экран    — шаги между сменами кадра на мониторе в обновлениях (1 — ровно; 2 — кадр показан дважды, рывок);
+  телефон  — шаги между снятыми кадрами (1 — телефон рисовал каждый такт);
+  пропуск  — откуда каждый лишний шаг экрана: «телефон» (не было кадра) или «опоздал» (кадр был, не успел к обновлению).
+"""
+import csv
+import importlib.machinery
+import statistics
+import struct
+import importlib.util
+import os
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REMOTE = "/tmp/naomi-smooth"
+VINPUT = "naomi-pi/src/pi/tools/vinput.py"
+PANEL = 40   # высота панели стола, точек: окна — под ней
+
+
+def naomi_module():
+    loader = importlib.machinery.SourceFileLoader("naomi", os.path.join(ROOT, "tools", "naomi"))
+    spec = importlib.util.spec_from_loader("naomi", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+os.environ.setdefault("NAOMI_VIA", "wifi")   # кабель телефона — у Pi; к телефону — по Wi-Fi
+NAOMI = naomi_module()
+
+
+def desk_size():
+    for kv in os.environ.get("PI_ENV", "").split():
+        if kv.startswith("NAOMI_DOCK_DESK="):
+            wh = kv.split("=", 1)[1].split("@")[0]
+            w, h = wh.split("x")
+            return int(w), int(h)
+    return 1600, 900   # как у приёмника по умолчанию на мониторе 16:9
+
+
+def web_rect():
+    """Окно браузера: QRectF из web.conf (QSettings @Variant: тип 0x14, четыре double)."""
+    raw = subprocess.run(NAOMI.ssh_argv("grep '^window=' ~/.config/naomi/desktop/web.conf"), capture_output=True,
+                         text=True).stdout.strip().split("=", 1)[1]
+    if raw.startswith('"') and raw.endswith('"'):   # QSettings берёт в кавычки, если внутри «=», «;», «,»
+        raw = raw[1:-1]
+    raw = raw[len("@Variant("):-1]
+    out, i = bytearray(), 0
+    while i < len(raw):
+        if raw[i] == "\\":
+            c = raw[i + 1]
+            if c == "x":   # QSettings: \x и столько шестнадцатеричных цифр, сколько есть (\xf, \x94)
+                j = i + 2
+                while j < len(raw) and j < i + 4 and raw[j] in "0123456789abcdefABCDEF":
+                    j += 1
+                out.append(int(raw[i + 2:j], 16))
+                i = j
+                continue
+            out.append({"0": 0, "a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}[c])
+            i += 2
+        else:
+            out.append(ord(raw[i]))
+            i += 1
+    return struct.unpack(">4d", bytes(out[4:36]))
+
+
+def points():
+    x, y, w, h = web_rect()
+    W, H = desk_size()
+    title = ((x + w * 0.82) / W, (PANEL + y + 25) / H)
+    text = ((x + w * 0.45) / W, (PANEL + y + h * 0.6) / H)
+    f = lambda p: [f"{p[0]:.4f}", f"{p[1]:.4f}"]
+    return f(title), f(text)
+
+
+# сборщик на телефоне: раз в 0,5 с — процессор (занято, % всех ядер), видеочип (занят, %; частота, МГц), температуры
+SAMPLER = r'''
+import time, glob
+zones = {}
+for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+    try: zones[open(z + "/type").read().strip()] = z + "/temp"
+    except OSError: pass
+want = ["cpu-1-0-usr", "gpuss-0-usr", "xo-therm-usr"]
+def cpu():
+    v = list(map(int, open("/proc/stat").readline().split()[1:]))
+    return sum(v), v[3] + v[4]
+t0 = time.time(); prev = cpu()
+print("t,cpu,gpu,gpumhz," + ",".join(want), flush=True)
+while time.time() - t0 < DURATION:
+    time.sleep(0.5)
+    now = cpu(); tot, idle = now[0] - prev[0], now[1] - prev[1]; prev = now
+    gpu = open("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage").read().split()[0]
+    mhz = int(open("/sys/class/kgsl/kgsl-3d0/gpuclk").read()) // 1000000
+    temps = [str(int(open(zones[w]).read()) / 1000) if w in zones else "" for w in want]
+    print(f"{time.time() - t0:.1f},{100 * (tot - idle) / max(1, tot):.0f},{gpu},{mhz}," + ",".join(temps), flush=True)
+'''
+
+
+def pi_module():
+    loader = importlib.machinery.SourceFileLoader("pi", os.path.join(ROOT, "tools", "pi"))
+    spec = importlib.util.spec_from_loader("pi", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+PI = pi_module()
+
+
+def ssh(cmd):
+    return subprocess.run(PI.SSH + [f"naomi@{PI.HOST}", cmd], capture_output=True, text=True)
+
+
+def scenario(name, hz):
+    step = max(1, round(500 / hz / 1.02))   # ~500 пикселей экрана в секунду (ускорение при такой скорости ≈ 1,02)
+    TITLE, TEXT = points()
+    if name == "cursor":
+        return ["wait", "2.5", "abs", "0.5", "0.5", "wait", "0.5", "circle", str(step * 3), "4"]
+    if name == "drag":
+        # размах — не дальше, чем окно может уйти до края стола (стол не пускает окно за край — у края ход
+        # окна неровный, это не рывок), в сторону, где места больше; качаний — на ~6 с хода
+        x, y, w, h = web_rect()
+        W, H = desk_size()
+        left, right = x, W - (x + w)
+        travel = max(40.0, max(left, right) - 20)                       # точек стола
+        leg = min(1.0, travel * 2560 / W / 500)                         # секунд при ~500 пикс экрана/с
+        sign = 1 if right >= left else -1
+        cmds = ["wait", "2.5", "abs", *TITLE, "wait", "0.5", "press", "wait", "0.2"]
+        for _ in range(max(3, round(6 / (2 * leg)))):
+            cmds += ["rel", str(sign * step), "0", f"{leg:.2f}", "rel", str(-sign * step), "0", f"{leg:.2f}"]
+        return cmds + ["wait", "0.2", "release"]
+    if name == "scroll":
+        return ["wait", "2.5", "abs", *TEXT, "wait", "0.5", "wheel", "-15", "10", "wait", "0.6", "wheel", "15", "10"]
+    if name == "thumb":
+        # ползунок — 7 точек от правого края окна, под стрелкой вверх (страница в самом верху — ползунок там же)
+        x, y, w, h = web_rect()
+        W, H = desk_size()
+        thumb = [f"{(x + w - 7.2) / W:.4f}", f"{(PANEL + y + 40 + 25) / H:.4f}"]
+        cmds = ["wait", "2.5", "abs", *thumb, "wait", "0.5", "press", "wait", "0.3"]
+        for step in (1, 2, 4):
+            cmds += ["rel", "0", str(step), "1.5", "wait", "0.3"]
+        for step in (4, 2, 1):
+            cmds += ["rel", "0", str(-step), "1.5", "wait", "0.3"]
+        return cmds + ["release"]
+    sys.exit(f"нет сценария {name}")
+
+
+def record(name, hz):
+    out = os.path.join(ROOT, "reports", f"smooth-{time.strftime('%Y%m%d-%H%M%S')}-{name}-{hz}")
+    os.makedirs(out)
+    cmds = " ".join(scenario(name, hz))
+    open(os.path.join(out, "window.txt"), "w").write(" ".join(map(str, (*web_rect(), *desk_size()))))
+    # нагрузка телефона — всё время замера (≈ 4 с запуска приёмника + сценарий)
+    sampler = subprocess.Popen(NAOMI.ssh_argv(f"python3 -c '{SAMPLER.replace('DURATION', '22')}'"),
+                               stdout=open(os.path.join(out, "phone.csv"), "w"), stderr=subprocess.DEVNULL)
+    started = time.time()
+    r = ssh(f"rm -rf {REMOTE}; mkdir -p {REMOTE}; sudo systemctl stop naomi-dock; "
+            f"sudo env NAOMI_DOCK_TRACE={REMOTE}/trace.csv NAOMI_DOCK_PTRACE={REMOTE}/pointer.csv "
+            f"{'NAOMI_DOCK_DUMP=' + REMOTE + '/stream.h265' if name in ('drag', 'thumb') else ''} "
+            f"{os.environ.get('PI_ENV', '')} nohup {PI.BIN} "
+            f"> {REMOTE}/dock.log 2>&1 & sleep 4; "
+            f"sudo python3 {VINPUT} --hz {hz} --log {REMOTE}/input.csv {cmds}; sleep 0.8; "
+            f"sudo pkill -INT -x naomi-dock; sleep 0.8; sudo chmod a+r {REMOTE}/*")
+    if r.returncode:
+        sys.exit(f"на Pi не вышло: {r.stderr}")
+    sampler.terminate()
+    span = int(time.time() - started) + 2
+    log = subprocess.run(NAOMI.ssh_argv(f"journalctl -u naomi-shell --since '-{span}s' --no-pager -o cat | "
+                                        "grep -E 'naomi.stream: кадров|рабочий стол:|кодер запущен|стол [0-9]'"),
+                         capture_output=True, text=True).stdout
+    open(os.path.join(out, "phone-stream.log"), "w").write(log)
+    subprocess.run(["scp", "-q", *PI.SSH[1:], f"naomi@{PI.HOST}:{REMOTE}/*", out], check=True)
+    return out
+
+
+def pct(v, q):
+    v = sorted(v)
+    return v[min(len(v) - 1, int(q * (len(v) - 1) + 0.5))] if v else float("nan")
+
+
+def analyze(folder):
+    rows = [{k: int(v) for k, v in r.items()} for r in csv.DictReader(open(os.path.join(folder, "trace.csv")))]
+    inp = list(csv.DictReader(open(os.path.join(folder, "input.csv"))))
+    log = open(os.path.join(folder, "dock.log")).read()
+    hz = 74.96
+    for line in log.splitlines():
+        if line.startswith("экран:") and "Гц" in line:
+            hz = float(line.split(",")[-1].split()[0])
+    P = 1e6 / hz
+    active = [int(r["t"]) for r in inp if r["kind"] in ("rel", "wheel", "press", "release")]
+    if not active or not rows:
+        return f"{os.path.basename(folder)}: нет данных"
+    t0, t1 = active[0] + 100000, active[-1] + 300000
+    shown = sorted((r for r in rows if r["shown"] and t0 <= r["shown"] <= t1), key=lambda r: r["shown"])
+    dropped = [r for r in rows if not r["shown"] and t0 <= r["recv"] <= t1]
+    if len(shown) < 3:
+        return f"{os.path.basename(folder)}: кадров почти нет ({len(shown)}) — стол не двигался"
+    # экран: шаги между сменами кадра в обновлениях монитора
+    steps = [round((b["shown"] - a["shown"]) / P) for a, b in zip(shown, shown[1:])]
+    # телефон: шаги между снятыми кадрами (его такт — 1/75 с; кадры и показанные, и выброшенные)
+    caps = sorted(r["capture"] for r in shown + dropped)
+    phone_step = 1e6 / 75
+    src = [round((b - a) / phone_step) for a, b in zip(caps, caps[1:]) if b - a <= 100000]
+    # откуда лишние шаги экрана: кадры по такту знают своё обновление (target) — встал позже него: опоздал
+    from_phone = late = 0
+    for a, b in zip(shown, shown[1:]):
+        k = round((b["shown"] - a["shown"]) / P)
+        if k < 2 or k * P > 100000:   # ровно — или пауза сценария
+            continue
+        if b.get("target"):
+            l = max(0, round((b["shown"] - b["target"]) / P))
+            late += min(k - 1, l)
+            from_phone += max(0, k - 1 - l)
+            continue
+        gap = round((b["capture"] - a["capture"]) / phone_step)
+        from_phone += min(k - 1, max(0, gap - 1))
+        late += max(0, (k - 1) - max(0, gap - 1))
+    # паузы сценария (мышь стоит перед «отпустить», между прокрутками) — стол честно не рисует: не в счёт
+    pauses = sum(k for k in steps if k * P > 100000)
+    steps = [k for k in steps if k * P <= 100000]
+    vblanks = round((shown[-1]["shown"] - shown[0]["shown"]) / P) + 1 - pauses
+    hist = lambda v: " ".join(f"{k}:{v.count(k)}" for k in sorted(set(v)) if k <= 3) + \
+        (f" 4+:{sum(1 for x in v if x >= 4)}" if any(x >= 4 for x in v) else "")
+    st = lambda key: [r for r in shown]
+    phone = [(r["encoded"] - r["capture"]) / 1000 for r in shown]
+    net = [(r["recv"] - (r["encoded"] - r["offset"])) / 1000 for r in shown]
+    dec = [(r["decoded"] - r["recv"]) / 1000 for r in shown]
+    wait = [(r["shown"] - r["decoded"]) / 1000 for r in shown]
+    total = [(r["shown"] - (r["capture"] - r["offset"])) / 1000 for r in shown]
+    f = lambda v: f"{pct(v, .5):.1f}/{pct(v, .95):.1f}/{max(v):.0f}"
+    return (frame_line(log) + f"{os.path.basename(folder)}\n"
+            f"  экран: {len(shown)} кадров за {vblanks} обновлений ({100 * len(shown) / vblanks:.0f}%), шаги {hist(steps)}; "
+            f"выброшено {len(dropped)}\n"
+            f"  телефон: шаги {hist(src)}\n"
+            f"  лишних шагов экрана: {sum(k - 1 for k in steps)} — телефон не прислал {from_phone}, опоздал к обновлению {late}\n"
+            f"  мс (медиана/95%/макс): телефон {f(phone)}, связь {f(net)}, распаковка {f(dec)}, ждал экран {f(wait)}, "
+            f"итого {f(total)}" + phone_lines(folder) + (thumb_motion_if(folder) or motion(folder)))
+
+
+def motion(folder):
+    """Плавность перетаскивания по картинке: где окно в каждом кадре (запись потока) и на сколько оно сдвигается
+    от обновления к обновлению монитора. Три ступени — где пропадает ровность:
+      мышь     — положения, что ушли телефону в каждый такт (pointer.csv): шаг от такта к такту;
+      телефон  — окно в снятых кадрах: шаг от кадра к кадру против шага мыши за то же время;
+      монитор  — окно на экране: шаг от обновления к обновлению (кадр — тот, что встал на экран последним).
+    Ровно — шаг везде один и тот же (скорость постоянная, ~500 пикселей экрана в секунду)."""
+    stream, ptr = os.path.join(folder, "stream.h265"), os.path.join(folder, "pointer.csv")
+    if not all(os.path.exists(f) for f in (stream, ptr, os.path.join(folder, "window.txt"))):
+        return ""
+    W = int(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=width", "-of", "csv=p=0", stream],
+                           capture_output=True, text=True).stdout.split()[0])
+    wx, wy, ww, wh, dw, dh = map(float, open(os.path.join(folder, "window.txt")).read().split())
+    k = W / dw
+    band_y, band_h = int((PANEL + wy + 60) * k), int(wh * 0.6 * k)   # страница в окне
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", stream, "-vf",
+                          f"crop=iw:{band_h}:0:{band_y},scale=iw:1:flags=area,format=gray", "-f", "rawvideo", "-"],
+                         capture_output=True).stdout
+    prof = [raw[i:i + W] for i in range(0, len(raw) - W + 1, W)]
+    # окно — из настроек браузера при записи (точки стола), дальше — по найденным сдвигам; сдвиг — по узору внутри
+    # окна (полоса его страницы), до долей пикселя: цвет страницы не важен
+    wx, wy, ww, wh, dw, dh = map(float, open(os.path.join(folder, "window.txt")).read().split())
+    k = W / dw   # пикселей кадра в точке
+    def shift(a, b, left):
+        lo, hi = max(int(left + 30), 30), min(int(left + ww * k - 30), W - 30)
+        if hi - lo < 200:
+            return 0.0
+        def sad(sft):
+            return sum(abs(b[x + sft] - a[x]) for x in range(lo, hi, 2))
+        best = min(range(-25, 26), key=sad)
+        if -25 < best < 25:   # парабола по трём точкам — доля пикселя
+            y0, y1, y2 = sad(best - 1), sad(best), sad(best + 1)
+            den = y0 - 2 * y1 + y2
+            return best + (0.5 * (y0 - y2) / den if den else 0)
+        return float(best)
+    xs, x = [], 0.0
+    for i, p in enumerate(prof):
+        if i:
+            x += shift(prof[i - 1], p, wx * k + x)
+        xs.append(x)
+    rows = sorted(({k: int(v) for k, v in r.items()} for r in csv.DictReader(open(os.path.join(folder, "trace.csv")))),
+                  key=lambda r: r["capture"])
+    if len(rows) != len(xs):
+        return f"\n  движение: кадров в записи {len(xs)}, в трассе {len(rows)} — не сопоставить"
+    log = open(os.path.join(folder, "dock.log")).read()
+    hz = 74.96
+    for line in log.splitlines():
+        if line.startswith("экран:") and "Гц" in line:
+            hz = float(line.split(",")[-1].split()[0])
+    P = 1e6 / hz
+    scale = W / 2560   # пиксели кадра на пиксель монитора (кадр растянут на 2560)
+    # мышь: что ушло телефону в такт (пиксели монитора → кадра)
+    sent = [(int(r["t"]), float(r["x"]) * scale) for r in csv.DictReader(open(ptr)) if r["kind"] == "s"]
+    inp = list(csv.DictReader(open(os.path.join(folder, "input.csv"))))
+    press = [int(r["t"]) for r in inp if r["kind"] == "press"]
+    rel = [int(r["t"]) for r in inp if r["kind"] == "rel"]
+    if not press or not rel:
+        return ""
+    # участки ровного хода: каждую секунду мышь меняет сторону; берём середину участка (без разворотов)
+    turns = [int(r["t"]) for a, r in zip(inp, inp[1:]) if r["kind"] == "rel" and a["kind"] == "rel" and (int(a["a"]) > 0) != (int(r["a"]) > 0)]
+    edges = [rel[0]] + turns + [rel[-1]]
+    segs = [(a + 150000, b - 100000) for a, b in zip(edges, edges[1:]) if b - a > 500000]
+    inside = lambda t: any(a <= t <= b for a, b in segs)
+    def steps_stats(v, ideal):
+        dev = [abs(d - ideal) / abs(ideal) for d in v] if ideal else []
+        bad = sum(1 for d in dev if d > 0.3)
+        return f"шаг {statistics.median([abs(d) for d in v]):.2f} пикс, разброс ±{100 * statistics.pstdev(v) / abs(ideal):.0f}%, рывков (>30%) {bad} из {len(v)}"
+    out = "\n  движение окна (по картинке, пиксели кадра):"
+    # 1. мышь
+    st = [(b[1] - a[1]) for a, b in zip(sent, sent[1:]) if inside(b[0]) and inside(a[0]) and b[0] - a[0] < 1.5 * P]
+    ideal = statistics.median([abs(d) for d in st]) if st else 0
+    if st:
+        out += f"\n    мышь → телефону в такт: {steps_stats([abs(d) for d in st], ideal)}"
+    # 2. телефон: окно в снятых кадрах; шаг на кадр против времени между кадрами
+    capt = [(rows[k]["capture"] - rows[k]["offset"], xs[k]) for k in range(len(rows))]
+    st2 = [abs(b[1] - a[1]) / max(1, round((b[0] - a[0]) / P)) for a, b in zip(capt, capt[1:]) if inside(b[0]) and inside(a[0])]
+    if st2:
+        out += f"\n    телефон, окно в кадрах:  {steps_stats(st2, ideal)}"
+    # 3. монитор: в каждое обновление — последний вставший кадр
+    shown = sorted((rows[k]["shown"], xs[k]) for k in range(len(rows)) if rows[k]["shown"])
+    t0, t1 = shown[0][0], shown[-1][0]
+    disp, j, cur = [], 0, None
+    n = int((t1 - t0) / P)
+    for i in range(n + 1):
+        v = t0 + i * P + P / 2
+        while j < len(shown) and shown[j][0] <= v:
+            cur = shown[j][1]
+            j += 1
+        disp.append((v, cur))
+    st3 = [abs(b[1] - a[1]) for a, b in zip(disp, disp[1:]) if inside(b[0] - 45000) and inside(a[0] - 45000)]
+    if st3:
+        out += f"\n    монитор, окно на экране:  {steps_stats(st3, ideal)}"
+        zeros = sum(1 for d in st3 if d < 0.3 * ideal)
+        doubles = sum(1 for d in st3 if d > 1.6 * ideal)
+        out += f" (стоял: {zeros}, двойной шаг: {doubles})"
+    return out
+
+
+def thumb_motion(folder):
+    """Листание ползунком по картинке: на сколько сдвинулась страница от кадра к кадру (вертикальный узор полосы
+    страницы, грубо по каждому 4-му пикселю, затем точно), на трёх ступенях, как motion(): мышь (положение, ушедшее
+    телефону в такт), телефон (снятые кадры), монитор (кадр на экране в каждое обновление). Участки — ходы мыши одной
+    скорости (input.csv), без 0,4 с смены скорости; ровно — шаг страницы на участке везде один."""
+    stream, ptr = os.path.join(folder, "stream.h265"), os.path.join(folder, "pointer.csv")
+    if not all(os.path.exists(f) for f in (stream, ptr, os.path.join(folder, "window.txt"))):
+        return ""
+    W, H = (int(v) for v in subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=width,height", "-of",
+                                             "csv=p=0", stream], capture_output=True, text=True).stdout.split(",")[:2])
+    wx, wy, ww, wh, dw, dh = map(float, open(os.path.join(folder, "window.txt")).read().split())
+    k = W / dw
+    x0, x1 = int((wx + 20) * k), int((wx + ww - 30) * k)          # страница без полосы прокрутки
+    y0, y1 = int((PANEL + wy + 40 + 10) * k), int((PANEL + wy + wh - 10) * k)
+    n = y1 - y0
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", stream, "-vf",
+                          f"crop={x1 - x0}:{n}:{x0}:{y0},scale=1:{n}:flags=area,format=gray", "-f", "rawvideo", "-"],
+                         capture_output=True).stdout
+    prof = [raw[i:i + n] for i in range(0, len(raw) - n + 1, n)]
+    def sad(a, b, sft, step=1, lo=0, hi=None):
+        hi = hi or n
+        a0, a1 = max(lo, -sft + lo), min(hi, hi - sft)
+        return sum(abs(b[y + sft] - a[y]) for y in range(max(a0, 150), min(a1, n - 150), step)) / max(1, (a1 - a0) // step)
+    def shift(a, b):   # страница поехала вверх (листают вниз) — узор в b на sft выше: b[y + sft] = a[y], sft < 0
+        best = min(range(-160, 161, 4), key=lambda d: sad(a, b, d, 4))
+        best = min(range(best - 4, best + 5), key=lambda d: sad(a, b, d, 1))
+        y0_, y1_, y2_ = sad(a, b, best - 1), sad(a, b, best), sad(a, b, best + 1)
+        den = y0_ - 2 * y1_ + y2_
+        return best + (0.5 * (y0_ - y2_) / den if den else 0)
+    ys, y = [], 0.0
+    for i, p in enumerate(prof):
+        if i:
+            y += shift(prof[i - 1], p)
+        ys.append(y)
+    rows = sorted(({kk: int(v) for kk, v in r.items()} for r in csv.DictReader(open(os.path.join(folder, "trace.csv")))),
+                  key=lambda r: r["capture"])
+    if 0 < len(ys) - len(rows) <= 3:   # последний кадр записан, но до экрана не дошёл — в трассе его нет
+        ys = ys[:len(rows)]
+    if len(rows) != len(ys):
+        return f"\n  листание: кадров в записи {len(ys)}, в трассе {len(rows)} — не сопоставить"
+    hz = 60.0
+    for line in open(os.path.join(folder, "dock.log")).read().splitlines():
+        if line.startswith("экран:") and "Гц" in line:
+            hz = float(line.split(",")[-1].split()[0])
+    P = 1e6 / hz
+    inp = list(csv.DictReader(open(os.path.join(folder, "input.csv"))))
+    legs, cur = [], None   # ходы одной скорости: (начало, конец, единиц за отчёт)
+    for r in inp:
+        if r["kind"] != "rel":
+            cur = None
+            continue
+        b = int(r["b"])
+        if cur and cur[2] == b and int(r["t"]) - cur[1] < 100000:
+            cur[1] = int(r["t"])
+        else:
+            cur = [int(r["t"]), int(r["t"]), b]
+            legs.append(cur)
+    sent = [(int(r["t"]), float(r["y"])) for r in csv.DictReader(open(ptr)) if r["kind"] == "s"]
+    capt = [(rows[i]["capture"] - rows[i]["offset"], ys[i]) for i in range(len(rows))]
+    shown = sorted((rows[i]["shown"], ys[i]) for i in range(len(rows)) if rows[i]["shown"])
+    disp, j, cv = [], 0, None
+    for i in range(int((shown[-1][0] - shown[0][0]) / P) + 1):
+        v = shown[0][0] + i * P + P / 2
+        while j < len(shown) and shown[j][0] <= v:
+            cv = shown[j][1]
+            j += 1
+        disp.append((v, cv))
+    out = "\n  листание ползунком (по картинке, пиксели кадра за обновление):"
+    lat = statistics.median([r["shown"] - (r["capture"] - r["offset"]) for r in rows if r["shown"]])
+    for a, b, unit in legs:
+        lo, hi = a + 400000, b   # смену скорости (первые 0,4 с хода) — не в счёт: у неё свой шаг
+        if hi - lo < 400000:
+            continue
+        m = [abs(q[1] - p_[1]) for p_, q in zip(sent, sent[1:]) if lo <= p_[0] and q[0] <= hi and q[0] - p_[0] < 1.5 * P]
+        ph = [abs(q[1] - p_[1]) / max(1, round((q[0] - p_[0]) / P)) for p_, q in zip(capt, capt[1:]) if lo <= p_[0] and q[0] <= hi]
+        mo = [abs(q[1] - p_[1]) for p_, q in zip(disp, disp[1:]) if lo <= p_[0] - lat and q[0] - lat <= hi]
+        if not mo or not ph:
+            continue
+        ideal = statistics.median(mo)
+        def st(v):
+            if not ideal:
+                return "стоит"
+            bad = sum(1 for d in v if abs(d - ideal) > 0.3 * ideal)
+            return (f"шаг {statistics.median(v):5.1f}, разброс ±{100 * statistics.pstdev(v) / ideal:3.0f}%, "
+                    f"рывков (>30%) {bad:2d} из {len(v)}")
+        stood = sum(1 for d in mo if d < 0.3 * ideal)
+        dbl = sum(1 for d in mo if d > 1.6 * ideal)
+        out += (f"\n    {'вниз' if unit > 0 else 'вверх'}, {abs(unit)} ед./отчёт (мышь {statistics.median(m) if m else 0:.1f} пикс экрана/такт):"
+                f"\n      телефон: {st(ph)}\n      монитор: {st(mo)} (стоял {stood}, двойной {dbl})")
+    return out
+
+
+def thumb_motion_if(folder):
+    return thumb_motion(folder) if folder.endswith(tuple(f"-thumb-{h}" for h in range(1000))) else ""
+
+
+def frame_line(log):
+    for line in log.splitlines():
+        if line.startswith("телефон: desktop"):
+            return f"  {line}\n"
+    return ""
+
+
+def phone_lines(folder):
+    """Нагрузка телефона во время сценария: средние за самые загруженные 5 с; его строки о трансляции."""
+    out = ""
+    path = os.path.join(folder, "phone.csv")
+    if os.path.exists(path):
+        rows = [r for r in csv.DictReader(open(path)) if r.get("gpu")]
+        busy = sorted(rows, key=lambda r: -float(r["gpu"]))[:10]   # ~5 с с наибольшей занятостью видеочипа
+        if busy:
+            mean = lambda k: statistics.mean(float(r[k]) for r in busy if r[k])
+            hot = lambda k: max((float(r[k]) for r in rows if r[k]), default=float("nan"))
+            out += (f"\n  телефон под нагрузкой (5 с): процессор {mean('cpu'):.0f}%, видеочип {mean('gpu'):.0f}% "
+                    f"при {mean('gpumhz'):.0f} МГц (макс. 625); темп. до: ЦП {hot('cpu-1-0-usr'):.1f}, "
+                    f"видеочип {hot('gpuss-0-usr'):.1f}, корпус {hot('xo-therm-usr'):.1f} °C")
+    path = os.path.join(folder, "phone-stream.log")
+    if os.path.exists(path):
+        st = [l for l in open(path) if "кадров" in l]
+        top = sorted(st, key=lambda l: -int(l.split("кадров ")[1].split(",")[0]))[:3]
+        for l in top:
+            out += "\n    " + l.strip().replace("naomi.stream: ", "")
+    return out
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["--again"]:
+        for folder in args[1:]:
+            print(analyze(folder))
+        return
+    runs = args or ["cursor@125", "drag@125", "drag@60", "scroll@60"]
+    try:
+        for run in runs:
+            name, _, hz = run.partition("@")
+            folder = record(name, int(hz or 125))
+            print(analyze(folder), flush=True)
+    finally:
+        ssh("sudo systemctl start naomi-dock")
+
+
+if __name__ == "__main__":
+    main()

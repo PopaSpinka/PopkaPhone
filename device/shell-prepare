@@ -1,0 +1,59 @@
+#!/bin/sh
+# НаомиФон — подготовка к запуску оболочки (от root, ExecStartPre службы naomi-shell).
+# 1. Ждёт composer дисплея в Android-контейнере: без него оболочке нечем рисовать.
+# 2. Даёт оболочке (phablet) писать яркость и команды контроллера касаний, читать прерывание датчика
+#    отпечатка (будит из AOD) — по умолчанию это Android-пользователь system.
+# 3. Даёт оболочке аппаратный видеокодер (трансляция экрана, docs/STREAM.md) — по умолчанию он у Android-группы camera.
+# 4. Выключает фильтр движения контроллера касаний (docs/SHELL.md, «Касания»); после выключения
+#    экрана оболочка включает это сама.
+# 5. Подключает schedtune — то, чем Android поднимает приложение на экране на большие ядра (docs/WEB.md, «Большие
+#    ядра для стола»): в ядре он есть, но Ubuntu Touch его не монтирует. Группа desk — программам стола (браузер);
+#    подъём в ней ставит оболочка (phablet), пока стол смотрят; prefer_idle — на свободные ядра, а не в очередь.
+# 6. Останавливает в Android-контейнере pixelstats-vendor — сборщик статистики Pixel для Google: отправлять её некому
+#    (служба android.frameworks.stats.IStats живёт в system_server, которого в контейнере нет), и он раз в секунду
+#    спрашивал о ней servicemanager, тот — init, тот писал отказ в logd (рентген 19 ноября 2026, docs/AUDIT.md,
+#    этап 8: servicemanager 19,7 → 11,6 пробуждений в секунду). Остановленную службу init сам не поднимает.
+# 7. Диск — без очередей планировщика (noop). По умолчанию у ядра cfq с настройками для жёсткого диска: очередь одной
+#    программы держит диск порцией до 100 мс, и чтение для стола стоит за чтением Android. Пока грузится игра Android,
+#    одно чтение 4 КБ «со стороны стола» ждало: 95 % проб — до 61 мс, худшее 126–156 мс; поток интерфейса оболочки,
+#    открывая файл посреди кадра, стоял по 70–90 мс. С noop — 1,7 мс и 9–12 мс: флеш-память сама держит 32 запроса
+#    сразу (замеры 20 ноября 2026, docs/ANDROID.md, «Память и диск»). Доли групп и ionice с noop не действуют — ими
+#    никто не пользовался.
+# 8. Запас свободной памяти. Подкачки нет, свободной памяти ядро по умолчанию держит ~11 МБ и начинает освобождать,
+#    когда уже поздно: программа, которой нужна страница, останавливается и освобождает память сама (за загрузку игры
+#    Android — 14–65 таких остановок). Запас 32 МБ и ранний старт фоновой очистки (порог 181 МБ, цель 330 МБ из 7,4 ГБ)
+#    — остановок 0.
+set -u
+
+for i in $(seq 1 60); do
+    [ "$(getprop init.svc.vendor.qti.hardware.display.composer 2>/dev/null)" = running ] && break
+    sleep 0.5
+done
+
+BL=/sys/class/backlight/panel0-backlight/brightness
+TSP=/sys/class/sec/tsp
+chgrp video "$BL" && chmod 664 "$BL"
+chgrp android_input "$TSP/cmd" && chmod 220 "$TSP/cmd"
+FP_IRQ=/sys/devices/platform/soc/soc:fp_fpc1020/irq
+chgrp android_input "$FP_IRQ" && chmod 640 "$FP_IRQ"
+ENC=$(readlink -f /dev/video/venus_enc 2>/dev/null) && [ -c "$ENC" ] && chgrp video "$ENC" && chmod 660 "$ENC"
+echo set_continuous_report_enable,1 > "$TSP/cmd" 2>/dev/null || true
+setprop ctl.stop vendor.pixelstats_vendor 2>/dev/null || true
+
+DISK=$(awk '$2 == "/userdata" { print $1; exit }' /proc/mounts | sed -E 's|^/dev/||; s|[0-9]+$||')
+SCHED=/sys/block/$DISK/queue/scheduler
+[ -n "$DISK" ] && grep -qw noop "$SCHED" 2>/dev/null && echo noop > "$SCHED"
+echo 200 > /proc/sys/vm/watermark_scale_factor
+echo 32768 > /proc/sys/vm/min_free_kbytes
+
+STUNE=/dev/stune
+if grep -q '^schedtune' /proc/cgroups; then
+    mkdir -p "$STUNE"
+    mountpoint -q "$STUNE" || mount -t cgroup -o schedtune stune "$STUNE"
+    if mkdir -p "$STUNE/desk" 2>/dev/null; then
+        echo 0 > "$STUNE/desk/schedtune.boost"
+        echo 1 > "$STUNE/desk/schedtune.prefer_idle"
+        chown phablet:phablet "$STUNE/desk/cgroup.procs" "$STUNE/desk/tasks" "$STUNE/desk/schedtune.boost"
+    fi
+fi
+exit 0

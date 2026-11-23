@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""НаомиФон — планшет вторым экраном приставки (docs/TABLET.md): команды с Mac, планшет — по adb (кабель USB).
+
+  tools/tablet build          собрать приложение (tablet/build.sh) → tablet/build/NaomiTablet.apk
+  tools/tablet install        собрать и поставить на планшет (adb install -r: сопряжение остаётся)
+  tools/tablet pair           сопрячь с приставкой: на Pi — сертификат (один раз) и новый ключ планшета
+                              (/var/lib/naomi-dock/tablet), на планшет — адреса Pi, отпечаток и ключ (files/pair.conf
+                              приложения, через run-as). Ключ не ложится на Mac. Сопрячь снова — прежний ключ не годится
+  tools/tablet run            открыть приложение на планшете
+  tools/tablet stop           закрыть его
+  tools/tablet log [сек]      журнал приложения (adb logcat); с числом — столько секунд
+  tools/tablet shot [файл]    снимок экрана планшета (по умолчанию reports/tablet-shot.png)
+  tools/tablet trace on|off   каждый распакованный кадр — в журнал (с ближайшего открытия приложения)
+  tools/tablet finger ЖЕСТ X Y [DX DY МС]
+                              палец для проверок — в разбор касаний приложения (TestFinger.java): dtap — двойное
+                              касание, rtap — касание двумя пальцами, scroll — два пальца ведут на DX, DY за МС,
+                              drag — один палец; X, Y — пиксели экрана планшета (сенсор adb писать не даёт)
+  tools/tablet info           что за планшет: модель, Android, экран, Wi-Fi, декодеры HEVC
+  tools/tablet kiosk on|off|remove|status
+                              киоск (docs/TABLET.md, «Киоск»): on — сделать приложение владельцем устройства (adb dpm
+                              set-device-owner: на планшете не должно быть учётных записей) и включить киоск — на
+                              экране только «НаомиФон», без шторки, «домой» и жестов; off — выйти из киоска (владелец
+                              остаётся); remove — приложение перестаёт быть владельцем; status — как сейчас
+
+Планшет — первый в `adb devices` (или ANDROID_SERIAL). Pi — как у tools/pi (NAOMI_PI_HOST, naomi-pi.local).
+"""
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PKG = "com.popka.naomiphone.tablet"
+APK = os.path.join(ROOT, "tablet", "build", "NaomiTablet.apk")
+PI_HOST = os.environ.get("NAOMI_PI_HOST", "naomi-pi.local")
+PI_SSH = ["ssh", "-i", os.path.join(ROOT, "private", "ssh", "naomiphone_ed25519"), "-o", "IdentitiesOnly=yes",
+          "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+          "-o", f"UserKnownHostsFile={os.path.join(ROOT, 'private', 'ssh', 'known_hosts_pi')}", f"naomi@{PI_HOST}"]
+PORT = 8490   # pi/dock/tablet.h, tablet::kPort
+
+# На Pi (root): сертификат приставки — один раз (EC P-256, на 100 лет: планшет сверяет его отпечаток, не срок),
+# ключ планшета — новый при каждом сопряжении; папка и ключи — только root. Печатает отпечаток, ключ и адреса Pi.
+# Первое слово — чей ключ: tablet или tv (телевизор, tools/tv pair: сертификат — тот же, ключ — свой, в папке tv)
+PI_PAIR = r"""
+set -e
+d=/var/lib/naomi-dock/tablet
+t=/var/lib/naomi-dock/$1
+umask 077
+mkdir -p "$d" "$t"; chmod 700 "$d" "$t"; cd "$d"
+if [ ! -s cert.pem ] || [ ! -s key.pem ]; then
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 -subj /CN=naomi-pi \
+        -keyout key.pem -out cert.pem 2>/dev/null
+fi
+openssl rand -hex 32 > "$t/token.new" && mv "$t/token.new" "$t/token"
+echo "fingerprint=$(openssl x509 -in cert.pem -noout -fingerprint -sha256 | cut -d= -f2)"
+echo "token=$(cat "$t/token")"
+echo "addrs=$(hostname -I)"
+"""
+
+
+def adb(*args, check=True, capture=False, data=None):
+    r = subprocess.run(["adb", *args], check=False, text=True, input=data,
+                       stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE if capture else None)
+    if check and r.returncode != 0:
+        sys.exit(f"adb {' '.join(args)}: ошибка {r.returncode}" + (f"\n{r.stderr}" if capture and r.stderr else ""))
+    return r.stdout if capture else r.returncode
+
+
+def need_device():
+    out = adb("devices", capture=True)
+    rows = [l.split() for l in out.splitlines()[1:] if l.strip()]
+    if not rows:
+        sys.exit("планшета нет: подключите кабелем USB (режим разработчика, «Отладка по USB»)")
+    serial = os.environ.get("ANDROID_SERIAL") or rows[0][0]
+    state = dict((r[0], r[1]) for r in rows if len(r) > 1).get(serial)
+    if state == "unauthorized":
+        sys.exit("планшет не разрешил отладку: на его экране — «Разрешить отладку по USB?» → «Разрешить»")
+    if state != "device":
+        sys.exit(f"планшет {serial}: {state}")
+    os.environ["ANDROID_SERIAL"] = serial
+
+
+def build():
+    subprocess.run([os.path.join(ROOT, "tablet", "build.sh")], check=True)
+
+
+def pair(who="tablet", port=PORT, extra=""):
+    need_device()
+    r = subprocess.run([*PI_SSH, f"sudo sh -s -- {who}"], input=PI_PAIR, text=True, capture_output=True)
+    if r.returncode != 0:
+        sys.exit(f"Pi: {r.stderr.strip() or r.returncode}")
+    kv = dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+    fp, token = kv.get("fingerprint", ""), kv.get("token", "")
+    if not re.fullmatch(r"([0-9A-F]{2}:){31}[0-9A-F]{2}", fp) or not re.fullmatch(r"[0-9a-f]{64}", token):
+        sys.exit("Pi: не те отпечаток или ключ")
+    # адреса: домашняя сеть (не кабель телефона 10.77.0.x) — сначала числом (мгновенно), потом именем (адрес сменился)
+    addrs = [a for a in kv.get("addrs", "").split() if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", a) and not a.startswith("10.77.0.")]
+    hosts = addrs + [PI_HOST]
+    conf = f"hosts={','.join(hosts)}\nport={port}\n{extra}fingerprint={fp}\ntoken={token}\n"
+    adb("shell", f"run-as {PKG} sh -c 'mkdir -p files && chmod 700 files && cat > files/pair.conf && chmod 600 files/pair.conf'", data=conf)
+    print(f"сопряжено: приставка {', '.join(hosts)}:{port}, отпечаток сертификата {fp[:23]}…")
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    cmd, args = (argv[0], argv[1:]) if argv else ("help", [])
+    if cmd == "build":
+        build()
+    elif cmd == "install":
+        need_device()
+        build()
+        adb("install", "-r", APK)
+    elif cmd == "pair":
+        pair()
+    elif cmd == "run":
+        need_device()
+        adb("shell", "am", "start", "-n", f"{PKG}/.MainActivity")
+    elif cmd == "stop":
+        need_device()
+        adb("shell", "am", "force-stop", PKG)
+    elif cmd == "log":
+        need_device()
+        a = ["logcat", "-v", "time", "-s", "NaomiTablet:V", "AndroidRuntime:E"]
+        if args:
+            subprocess.run(["timeout", args[0], "adb", *a])
+        else:
+            adb(*a, check=False)
+    elif cmd == "shot":
+        need_device()
+        path = args[0] if args else os.path.join(ROOT, "reports", "tablet-shot.png")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        png = subprocess.run(["adb", "exec-out", "screencap", "-p"], stdout=subprocess.PIPE, check=True).stdout
+        at = png.find(b"\x89PNG\r\n")   # телевизор TCL перед картинкой пишет в тот же вывод строки своих служб
+        if at < 0:
+            sys.exit("снимок не получился")
+        with open(path, "wb") as f:
+            f.write(png[at:])
+        print(path)
+    elif cmd == "trace":
+        need_device()
+        on = (args or ["on"])[0] != "off"
+        adb("shell", f"run-as {PKG} sh -c '{'touch files/trace' if on else 'rm -f files/trace'}'")
+        print("покадровый журнал:", "вкл" if on else "выкл", "— с ближайшего открытия (tools/tablet stop; tools/tablet run)")
+    elif cmd == "finger":
+        need_device()
+        if len(args) < 3:
+            sys.exit("tools/tablet finger dtap|rtap|scroll|drag X Y [DX DY МС]")
+        extra = ["--es", "g", args[0], "--ei", "x", args[1], "--ei", "y", args[2]]
+        for k, v in zip(("dx", "dy", "ms"), args[3:6]):
+            extra += ["--ei", k, v]
+        adb("shell", "am", "broadcast", "-a", f"{PKG}.FINGER", "-p", PKG, *extra, capture=True)
+    elif cmd == "kiosk":
+        need_device()
+        what = (args or ["status"])[0]
+        owner = PKG in adb("shell", "dpm", "list-owners", check=False, capture=True) \
+            or PKG in adb("shell", "dumpsys", "device_policy", check=False, capture=True).split("Device Owner")[-1][:400]
+        if what == "on":
+            if not owner:
+                out = adb("shell", "dpm", "set-device-owner", f"{PKG}/.AdminReceiver", check=False, capture=True)
+                print((out or "").strip() or "владелец устройства назначен")
+            adb("shell", f"run-as {PKG} sh -c 'rm -f files/kiosk-off'")
+            adb("shell", "am", "force-stop", PKG)
+            adb("shell", "am", "start", "-n", f"{PKG}/.MainActivity", capture=True)
+            print("киоск включён: на экране только «НаомиФон»; выйти — tools/tablet kiosk off")
+        elif what == "off":
+            adb("shell", f"run-as {PKG} sh -c 'mkdir -p files && touch files/kiosk-off'")
+            adb("shell", "am", "force-stop", PKG)
+            adb("shell", "am", "start", "-n", f"{PKG}/.MainActivity", capture=True)
+            print("киоск выключен (приложение остаётся владельцем устройства; совсем — tools/tablet kiosk remove)")
+        elif what == "remove":
+            adb("shell", "am", "start", "-n", f"{PKG}/.MainActivity", capture=True)
+            adb("shell", "am", "broadcast", "-a", f"{PKG}.KIOSK", "-p", PKG, "--es", "do", "remove", capture=True)
+            print("приложение больше не владелец устройства" if not owner else "попросил приложение перестать быть владельцем")
+        else:
+            off = "kiosk-off" in adb("shell", f"run-as {PKG} ls files", check=False, capture=True)
+            print("владелец устройства:", "да" if owner else "нет", "· киоск:", "включён" if owner and not off else "выключен")
+    elif cmd == "info":
+        need_device()
+        for label, c in (("модель", "getprop ro.product.manufacturer; getprop ro.product.model; getprop ro.product.device"),
+                         ("Android", "getprop ro.build.version.release; getprop ro.build.version.sdk"),
+                         ("процессор", "getprop ro.soc.manufacturer; getprop ro.soc.model; getprop ro.board.platform"),
+                         ("экран", "wm size; wm density; dumpsys display | grep -m3 -o 'refreshRate=[0-9.]*\\|fps=[0-9.]*'"),
+                         ("Wi-Fi", "ip -4 -br addr show wlan0"),
+                         ("декодеры HEVC", "dumpsys media.player 2>/dev/null | grep -i -A2 'hevc' | grep -i decoder | head"),
+                         ("приложение", f"dumpsys package {PKG} | grep -m2 'versionName\\|versionCode'")):
+            print(f"── {label}")
+            print(adb("shell", c, check=False, capture=True).strip())
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

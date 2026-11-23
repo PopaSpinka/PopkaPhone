@@ -1,0 +1,16 @@
+{
+  "name": "naomiphone-mirror",
+  "productName": "NaomiPhone Mirror",
+  "version": "0.1.0",
+  "description": "Экран НаомиФона в окне на Mac или Linux: видео с телефона, мышь, трекпад и клавиатура — ему",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "build": "./build.sh"
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.3.0",
+    "electron": "^45.2.3"
+  }
+}

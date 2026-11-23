@@ -1,0 +1,20 @@
+.DS_Store
+# образы и скачанное — не в git
+images/
+downloads/
+*.img
+*.zip
+*.zst
+# ключи и личное
+private/
+secrets/
+__pycache__/
+logs/
+reports/
+# окно трансляции: сборка приложения
+mirror/dist/
+mirror/node_modules/
+mirror/package-lock.json
+mirror/home.json
+# приложение планшета: сборка
+tablet/build/

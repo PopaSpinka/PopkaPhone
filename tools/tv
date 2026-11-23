@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""НаомиФон — телевизор экраном стола (docs/TV.md): команды с Mac, телевизор Android TV — по сетевому ADB.
+
+  tools/tv connect [АДРЕС]    запомнить адрес телевизора (private/tv/host) и подключиться (adb connect АДРЕС:5555;
+                              на телевизоре — «Отладка по сети», ключ Mac разрешён)
+  tools/tv install            собрать приложение (то же, что у планшета: tablet/build.sh) и поставить на телевизор
+  tools/tv pair               сопрячь с приставкой: ключ телевизора — /var/lib/naomi-dock/tv на Pi, в приложение —
+                              адреса Pi, порты экрана и дежурного, отпечаток и ключ (files/pair.conf, через run-as)
+  tools/tv access on|off|status
+                              служба телевизора (TvService — «специальные возможности»): кнопка пульта и включение со
+                              стола; исключение приложения из экономии энергии — во сне телевизор отрезает
+                              приложениям сеть, и служба не услышала бы приставку; автозапуск (у TCL —
+                              APP_AUTO_START) — без него телевизор не поднимает службу, когда приложение не
+                              запущено (после включения в розетку, обновления приложения). on и off меняют
+                              настройки безопасности и питания телевизора — запускает пользователь
+  tools/tv keys [СЕК]         что шлёт пульт: СЕК секунд (по умолчанию 20) нажимайте кнопку — покажет её коды
+                              (служба должна быть включена); ниже — и то, что видит само ядро (getevent)
+  tools/tv button KEY [SCAN]  выбрать кнопку пульта, что открывает приложение (коды — из tools/tv keys; SCAN — когда
+                              у нескольких кнопок один KEY); tools/tv button off — никакая
+  tools/tv status             что с телевизором: спит ли, что на экране, служба, сопряжение, кнопка
+  tools/tv run | stop         открыть приложение на телевизоре | закрыть
+  tools/tv log [СЕК]          журнал приложения и службы
+  tools/tv shot [ФАЙЛ]        снимок экрана телевизора (по умолчанию reports/tv-shot.png)
+  tools/tv info               модель, Android, экран, сеть, декодеры HEVC
+  tools/tv trace on|off       каждый распакованный кадр — в журнал
+
+Адрес — NAOMI_TV_HOST или private/tv/host. Pi — как у tools/pi (NAOMI_PI_HOST, naomi-pi.local).
+"""
+import importlib.machinery
+import importlib.util
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HOST_FILE = os.path.join(ROOT, "private", "tv", "host")
+PORT, AGENT_PORT = 8491, 8492   # pi/dock/tablet.h: kTvPort, kTvAgentPort
+
+_loader = importlib.machinery.SourceFileLoader("naomi_tablet", os.path.join(ROOT, "tools", "tablet"))
+tablet = importlib.util.module_from_spec(importlib.util.spec_from_loader("naomi_tablet", _loader))
+_loader.exec_module(tablet)
+PKG = tablet.PKG
+SERVICE = f"{PKG}/{PKG}.TvService"
+adb = tablet.adb
+
+
+def host():
+    h = os.environ.get("NAOMI_TV_HOST", "")
+    if not h and os.path.exists(HOST_FILE):
+        h = open(HOST_FILE).read().strip()
+    if not h:
+        sys.exit("адрес телевизора не задан: tools/tv connect АДРЕС (адрес — в настройках сети телевизора)")
+    return h if ":" in h else h + ":5555"
+
+
+def connect(quiet=True):
+    serial = host()
+    out = subprocess.run(["adb", "connect", serial], capture_output=True, text=True).stdout.strip()
+    state = dict(l.split()[:2] for l in subprocess.run(["adb", "devices"], capture_output=True, text=True)
+                 .stdout.splitlines()[1:] if l.strip()).get(serial)
+    if state == "unauthorized":
+        sys.exit("телевизор не разрешил отладку: на его экране — «Разрешить отладку?» → «Всегда разрешать»")
+    if state != "device":
+        sys.exit(f"телевизор {serial} не отвечает ({out or state}): спит (во сне его Wi-Fi выключен) или адрес сменился")
+    os.environ["ANDROID_SERIAL"] = serial
+    if not quiet:
+        print(f"телевизор на связи: {serial}")
+
+
+def sh(command, check=False):
+    return (adb("shell", command, check=check, capture=True) or "").strip()
+
+
+def services():
+    cur = sh("settings get secure enabled_accessibility_services")
+    return [x for x in cur.split(":") if x and x != "null"]
+
+
+def access(what):
+    cur = services()
+    # привязанные службы dumpsys называет по подписи (res/values/strings.xml, tv_service_label)
+    bound = "НаомиФон" in sh("dumpsys accessibility | grep -m1 'Bound services'")
+    if what == "on":
+        # TCL: автозапуск — иначе привязать службу, чей процесс не работает, система не может («forbid bind service …
+        # callee doesn't have OP_AUTO_START permission» в журнале телевизора)
+        sh(f"appops set {PKG} APP_AUTO_START allow", check=True)
+        # Убрать и записать снова: службу, чей процесс умер (приложение обновили — tools/tv install), этот телевизор
+        # сам не привязывает — значится включённой и не работает; привязывает он её на смену настройки
+        rest = [x for x in cur if x != SERVICE]
+        if SERVICE in cur and not bound:
+            sh("settings put secure enabled_accessibility_services " + (":".join(rest) if rest else '""'), check=True)
+        if SERVICE not in cur or not bound:
+            sh(f"settings put secure enabled_accessibility_services {':'.join(rest + [SERVICE])}", check=True)
+        sh("settings put secure accessibility_enabled 1", check=True)
+        sh(f"dumpsys deviceidle whitelist +{PKG}", check=True)
+        print("служба телевизора включена: кнопка пульта (tools/tv button) и включение со стола; "
+              "приложению разрешён автозапуск и оставлена сеть во сне телевизора")
+    elif what == "off":
+        rest = [x for x in cur if x != SERVICE]
+        sh("settings put secure enabled_accessibility_services " + (":".join(rest) if rest else '""'), check=True)
+        sh(f"dumpsys deviceidle whitelist -{PKG}", check=True)
+        sh(f"appops set {PKG} APP_AUTO_START default", check=True)
+        print("служба телевизора выключена; исключение из экономии энергии и автозапуск сняты")
+    else:
+        print("служба телевизора:", "включена" if SERVICE in cur else "выключена",
+              "· работает" if bound else "· не работает" if SERVICE in cur else "")
+        print("автозапуск (TCL):", "разрешён" if "APP_AUTO_START: allow" in sh(f"appops get {PKG}")
+              else "запрещён — телевизор не поднимет службу сам (tools/tv access on)")
+        print("сеть во сне телевизора:", "оставлена (исключение из экономии энергии)"
+              if PKG in sh("dumpsys deviceidle whitelist") else "отрезана — служба не услышит приставку (tools/tv access on)")
+
+
+def button(args):
+    if not args:
+        print(sh(f"run-as {PKG} cat files/tv.conf 2>/dev/null") or "кнопка не выбрана")
+        return
+    if args[0] == "off":
+        sh(f"run-as {PKG} rm -f files/tv.conf")
+        print("кнопка пульта: никакая")
+        return
+    conf = f"key={int(args[0])}\n" + (f"scan={int(args[1])}\n" if len(args) > 1 else "")
+    adb("shell", f"run-as {PKG} sh -c 'mkdir -p files && cat > files/tv.conf'", data=conf)
+    print("кнопка пульта:", conf.replace("\n", " ").strip(), "— открывает «НаомиФон» (нажали при открытом — закрывает)")
+
+
+def keys(seconds):
+    sh(f"run-as {PKG} sh -c 'mkdir -p files && touch files/keys'")
+    adb("logcat", "-c", check=False)
+    print(f"нажимайте кнопку пульта — слушаю {seconds} с…")
+    ev = subprocess.Popen(["adb", "shell", "getevent", "-l"], stdout=subprocess.PIPE, text=True)
+    try:
+        subprocess.run(["timeout", str(seconds), "adb", "logcat", "-v", "time", "-s", "NaomiTablet:I"],
+                       stdout=subprocess.PIPE, text=True, check=False)
+    finally:
+        ev.terminate()
+        sh(f"run-as {PKG} rm -f files/keys")
+    seen = [l.split("NaomiTablet: ", 1)[-1] for l in sh("logcat -d -v time -s NaomiTablet:I").splitlines() if "пульт: " in l]
+    print("── служба видит:" if seen else "── служба нажатий не видела (включена? tools/tv access status)")
+    for l in seen:
+        print("  ", l)
+    raw = [l.strip() for l in (ev.stdout.read() or "").splitlines() if "EV_KEY" in l or "EV_MSC" in l]
+    print("── ядро видит (getevent):" if raw else "── ядро нажатий не видело")
+    for l in raw[:40]:
+        print("  ", l)
+
+
+def status():
+    power = re.search(r"mWakefulness=(\w+)", sh("dumpsys power | grep mWakefulness="))
+    focus = re.search(r"mCurrentFocus=.*? (\S+)/", sh("dumpsys window | grep mCurrentFocus"))
+    print("телевизор:", {"Awake": "включён", "Asleep": "спит", "Dozing": "спит", "Dreaming": "заставка"}.get(
+        power.group(1) if power else "", "?"), "· на экране:", focus.group(1) if focus else "?")
+    ver = re.search(r"versionName=(\S+)", sh(f"dumpsys package {PKG} | grep -m1 versionName"))
+    print("приложение:", ver.group(1) if ver else "не стоит (tools/tv install)")
+    if not ver:
+        return
+    access("status")
+    conf = sh(f"run-as {PKG} cat files/pair.conf 2>/dev/null")
+    pair = dict(l.split("=", 1) for l in conf.splitlines() if "=" in l)
+    print("сопряжение:", f"приставка {pair.get('hosts')}, экран — порт {pair.get('port')}, дежурный — {pair.get('agent')}"
+          if pair.get("token") else "нет (tools/tv pair)")
+    print("кнопка пульта:", sh(f"run-as {PKG} cat files/tv.conf 2>/dev/null").replace("\n", " ") or "не выбрана")
+
+
+def main():
+    cmd, args = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("help", [])
+    if cmd in ("help", "-h", "--help"):
+        print(__doc__)
+        return
+    if cmd == "connect":
+        if args:
+            os.makedirs(os.path.dirname(HOST_FILE), exist_ok=True)
+            with open(HOST_FILE, "w") as f:
+                f.write(args[0] + "\n")
+        connect(quiet=False)
+        return
+    if cmd == "build":
+        tablet.build()
+        return
+    connect()
+    if cmd == "pair":
+        tablet.pair("tv", PORT, f"agent={AGENT_PORT}\n")
+    elif cmd == "access":
+        access((args or ["status"])[0])
+    elif cmd == "button":
+        button(args)
+    elif cmd == "keys":
+        keys(int(args[0]) if args else 20)
+    elif cmd == "status":
+        status()
+    elif cmd == "shot":
+        tablet.main(["shot", args[0] if args else os.path.join(ROOT, "reports", "tv-shot.png")])
+    elif cmd in ("install", "run", "stop", "log", "info", "trace"):
+        tablet.main([cmd, *args])
+        if cmd in ("install", "stop") and SERVICE in services():
+            # процесс службы убит вместе с приложением: телевизор поднимает её сам, если разрешён автозапуск
+            import time
+            time.sleep(6)
+            access("status")
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

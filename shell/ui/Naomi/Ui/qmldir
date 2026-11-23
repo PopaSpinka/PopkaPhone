@@ -1,0 +1,13 @@
+module Naomi.Ui
+singleton Theme 1.0 Theme.qml
+Caps 1.0 Caps.qml
+NSlider 1.0 NSlider.qml
+NToggle 1.0 NToggle.qml
+Bars 1.0 Bars.qml
+NButton 1.0 NButton.qml
+Axis 1.0 Axis.qml
+Keyboard 1.0 Keyboard.qml
+KeyboardPanel 1.0 KeyboardPanel.qml
+Spring 1.0 Spring.qml
+Spinner 1.0 Spinner.qml
+MorphIcon 1.0 MorphIcon.qml

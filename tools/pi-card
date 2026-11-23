@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""НаомиФон — карта microSD для Raspberry Pi 5, приёмника рабочего стола (docs/PI.md).
+
+  tools/pi-card          внешние диски, которые видит Mac
+  tools/pi-card diskN    записать Raspberry Pi OS Lite на diskN — СТИРАЕТ ВСЁ НА НЁМ
+
+Образ — downloads/raspios (с downloads.raspberrypi.com; SHA-256 архива и образа закреплены ниже). Пишет только
+на внешний физический диск до 512 ГБ и только после того, как имя диска набрано ещё раз. Запись — `sudo dd`
+(пароль Mac вводит пользователь). Потом проверка чтением: всё, кроме загрузочного раздела, — побайтно с образом;
+загрузочный раздел macOS сразу подключает и пишет туда свои служебные папки, поэтому он сверяется по файлам.
+В конце на него кладётся настройка первого запуска pi/boot/user-data с открытым ключом private/ssh.
+"""
+import filecmp
+import hashlib
+import os
+import plistlib
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+IMG_DIR = os.path.join(ROOT, "downloads", "raspios")
+IMG_XZ = "2026-10-06-raspios-trixie-arm64-lite.img.xz"
+XZ_SHA = "483db18a48da399b5b7022ffae9a07bc6d99daab30e593aedac09b69ff422843"   # .img.xz.sha256 с сайта
+IMG_SHA = "b8a393dc1c3701450b5fffbfe74368a98fb6eab7415ce456cc0cead886ea8780"  # распакованный, посчитан 15.11.2026
+USER_DATA = os.path.join(ROOT, "pi", "boot", "user-data")
+SSH_PUB = os.path.join(ROOT, "private", "ssh", "naomiphone_ed25519.pub")
+MAX_DISK = 512 * 10**9
+CHUNK = 4 << 20
+
+
+def say(msg):
+    print(f"\033[1;33m» {msg}\033[0m", flush=True)
+
+
+def ok(msg):
+    print(f"\033[1;32m✓ {msg}\033[0m", flush=True)
+
+
+def die(msg):
+    print(f"\033[1;31m✗ {msg}\033[0m", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(*cmd):
+    return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+
+
+def plist(*cmd):
+    return plistlib.loads(subprocess.run(cmd, check=True, capture_output=True).stdout)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(CHUNK):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def image():
+    xz, img = os.path.join(IMG_DIR, IMG_XZ), os.path.join(IMG_DIR, IMG_XZ[:-3])
+    if not os.path.exists(xz):
+        die(f"нет {xz} — скачать (docs/PI.md)")
+    if sha256_file(xz) != XZ_SHA:
+        die(f"SHA-256 {IMG_XZ} не совпадает")
+    if not os.path.exists(img) or sha256_file(img) != IMG_SHA:
+        say("распаковываю образ")
+        subprocess.run(["xz", "-dkf", xz], check=True)
+        if sha256_file(img) != IMG_SHA:
+            die("SHA-256 распакованного образа не совпадает")
+    ok(f"образ {IMG_XZ[:-3]}, SHA-256 сверен")
+    return img
+
+
+def partitions(img):
+    """(начало, конец) загрузочного раздела и размер образа — по его таблице разделов (MBR)."""
+    with open(img, "rb") as f:
+        mbr = f.read(512)
+    parts = []
+    for i in range(4):
+        entry = mbr[446 + 16 * i: 462 + 16 * i]
+        start, count = struct.unpack("<II", entry[8:16])
+        if entry[4]:
+            parts.append((start * 512, (start + count) * 512))
+    return parts[0], max(end for _, end in parts)
+
+
+def check_disk(disk):
+    info = plist("diskutil", "info", "-plist", disk)
+    size = info.get("Size", 0)
+    if info.get("Internal", True) or not info.get("WholeDisk") or info.get("VirtualOrPhysical") != "Physical":
+        die(f"{disk} — не внешний физический диск целиком")
+    if not 4 * 10**9 <= size <= MAX_DISK:
+        die(f"{disk}: {size / 1e9:.1f} ГБ — для карты Pi странный размер")
+    print(f"  {disk}: {info.get('MediaName', '?')}, {info.get('BusProtocol', '?')}, {size / 1e9:.1f} ГБ")
+    for part in plist("diskutil", "list", "-plist", disk).get("AllDisksAndPartitions", [{}])[0].get("Partitions", []):
+        mp = part.get("MountPoint")
+        names = sorted(n for n in os.listdir(mp) if not n.startswith(".")) if mp else []
+        print(f"    {part['DeviceIdentifier']} «{part.get('VolumeName', '')}» {part.get('Size', 0) / 1e9:.1f} ГБ"
+              + (f", в {mp}: {', '.join(names[:12]) or 'пусто'}" if mp else ", не подключён"))
+    return size
+
+
+def hash_outside(read, size, boot):
+    """SHA-256 первых size байт потока без загрузочного раздела [boot[0], boot[1])."""
+    h, pos = hashlib.sha256(), 0
+    while pos < size:
+        chunk = read(min(CHUNK, size - pos))
+        if not chunk:
+            die("карта прочиталась короче образа")
+        end = pos + len(chunk)
+        if pos < boot[0]:
+            h.update(chunk[: min(end, boot[0]) - pos])
+        if end > boot[1]:
+            h.update(chunk[max(pos, boot[1]) - pos:])
+        pos = end
+    return h.hexdigest()
+
+
+def same_tree(a, b):
+    """Каждый файл образа есть на карте и совпадает побайтно (служебные файлы macOS с точкой не в счёт)."""
+    bad = []
+    for top, dirs, files in os.walk(a):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in files:
+            if name.startswith("."):
+                continue
+            rel = os.path.relpath(os.path.join(top, name), a)
+            other = os.path.join(b, rel)
+            if not os.path.exists(other) or not filecmp.cmp(os.path.join(top, name), other, shallow=False):
+                bad.append(rel)
+    return bad
+
+
+def mount_point(dev):
+    for _ in range(50):
+        mp = plist("diskutil", "info", "-plist", dev).get("MountPoint")
+        if mp:
+            return mp
+        subprocess.run(["diskutil", "mount", dev], capture_output=True)
+        time.sleep(0.2)
+    die(f"{dev} не подключается")
+
+
+def write(disk):
+    img = image()
+    boot, img_size = partitions(img)
+    if check_disk(disk) < img_size:
+        die("карта меньше образа")
+    if input(f"Всё на {disk} сотрётся. Набери {disk}, чтобы продолжить: ").strip() != disk:
+        die("отменено")
+    key = open(SSH_PUB).read().strip()
+
+    run("diskutil", "unmountDisk", f"/dev/{disk}")
+    say("пишу образ (sudo dd — пароль Mac)")
+    subprocess.run(["sudo", "dd", f"if={img}", f"of=/dev/r{disk}", "bs=4m", "status=progress"], check=True)
+
+    say("проверяю чтением")
+    subprocess.run(["diskutil", "unmountDisk", f"/dev/{disk}"], capture_output=True)
+    want = hash_outside(open(img, "rb").read, img_size, boot)
+    dd = subprocess.Popen(["sudo", "dd", f"if=/dev/r{disk}", "bs=4m", f"count={-(-img_size // CHUNK)}"],
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    got = hash_outside(dd.stdout.read, img_size, boot)
+    dd.stdout.close()
+    dd.wait()
+    if got != want:
+        die("карта не совпала с образом (вне загрузочного раздела)")
+    ok("таблица разделов и система — побайтно как в образе")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dev = run("diskutil", "image", "attach", "--noMount", "--readOnly", img).split()[0]
+        try:
+            run("diskutil", "mount", "readOnly", "-mountPoint", tmp, f"{dev}s1")
+            card = mount_point(f"{disk}s1")
+            bad = same_tree(tmp, card)
+        finally:
+            subprocess.run(["diskutil", "eject", dev], capture_output=True)
+    if bad:
+        die(f"загрузочный раздел не совпал: {', '.join(bad[:10])}")
+    ok("загрузочный раздел — файлы как в образе")
+
+    zone = os.path.realpath("/etc/localtime").partition("/zoneinfo/")[2] or "Etc/UTC"   # пояс этого компьютера
+    text = open(USER_DATA).read().replace("@SSH_KEY@", key).replace("@TIMEZONE@", zone)
+    path = os.path.join(card, "user-data")
+    with open(path, "w") as f:
+        f.write(text)
+    if open(path).read() != text:
+        die("user-data не записался")
+    ok("первый запуск: pi/boot/user-data с ключом private/ssh")
+    run("diskutil", "eject", f"/dev/{disk}")
+    ok(f"{disk} готова и извлечена — карту можно вынимать")
+
+
+def main():
+    if len(sys.argv) == 1:
+        print(run("diskutil", "list", "external", "physical") or "внешних дисков нет")
+        return
+    if len(sys.argv) != 2 or not sys.argv[1].startswith("disk"):
+        die(__doc__)
+    write(sys.argv[1])
+
+
+if __name__ == "__main__":
+    main()

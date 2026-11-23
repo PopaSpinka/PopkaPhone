@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Платы ESP32 у НаомиФона (docs/BOARDS.md): плата в приставке Pi — на телефоне как своя (/dev/ttyACM…).
+
+  tools/boards build        собрать на телефоне драйверы, которых нет в его ядре (cdc-acm, usbip-core, vhci-hcd):
+                            device/kmod.py → ~/naomi/kmod/<ядро>/ (≈ 1,5 мин; первый раз — скачать исходники ≈ 190 МБ)
+  tools/boards install      службы naomi-usbshare: на Pi (pi/usbshare) — отдаёт платы по кабелю, на телефоне
+                            (device/naomi-usbshare) — грузит драйверы и забирает платы
+  tools/boards uninstall    убрать обе службы; платы — снова Pi
+  tools/boards status       что на телефоне и что на Pi
+"""
+import os
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+NAOMI = os.path.join(ROOT, "tools", "naomi")
+PI = os.path.join(ROOT, "tools", "pi")
+
+
+def run(tool, cmd, stdin=None, check=True):
+    with open(stdin, "rb") if stdin else open(os.devnull, "rb") as f:
+        r = subprocess.run([tool, "ssh", cmd], stdin=f)
+    if check and r.returncode:
+        sys.exit(r.returncode)
+    return r.returncode
+
+
+def push_phone(src, dest):
+    run(NAOMI, f"cat > {dest} && chmod +x {dest}", stdin=os.path.join(ROOT, src))
+
+
+def push_pi(src, dest):
+    run(PI, f"cat > {dest} && chmod +x {dest}", stdin=os.path.join(ROOT, src))
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
+    if cmd == "build":
+        push_phone("device/kmod.py", "~/naomi/bin/kmod.py")
+        run(NAOMI, "python3 ~/naomi/bin/kmod.py")
+    elif cmd == "install":
+        push_phone("device/naomi-usbshare", "~/naomi/bin/naomi-usbshare")
+        run(NAOMI, "test -f ~/naomi/kmod/$(uname -r)/vhci-hcd.ko || { echo 'драйверов нет: tools/boards build'; exit 1; }")
+        push_pi("pi/usbshare/naomi-usbshare", "/tmp/naomi-usbshare")
+        run(PI, "sudo -n python3 /tmp/naomi-usbshare install && rm /tmp/naomi-usbshare")
+        run(NAOMI, "sudo -n python3 ~/naomi/bin/naomi-usbshare install")
+    elif cmd == "uninstall":
+        run(NAOMI, "sudo -n python3 ~/naomi/bin/naomi-usbshare uninstall", check=False)
+        push_pi("pi/usbshare/naomi-usbshare", "/tmp/naomi-usbshare")
+        run(PI, "sudo -n python3 /tmp/naomi-usbshare uninstall; rm /tmp/naomi-usbshare", check=False)
+    elif cmd == "status":
+        print("— телефон", flush=True)
+        run(NAOMI, "systemctl is-active naomi-usbshare; sudo -n python3 ~/naomi/bin/naomi-usbshare status; "
+                   "ls -l /dev/ttyACM* 2>/dev/null", check=False)
+        print("— Pi", flush=True)
+        run(PI, "systemctl is-active naomi-usbshare; sudo -n python3 /usr/local/sbin/naomi-usbshare list", check=False)
+    else:
+        print(__doc__.strip())
+
+
+if __name__ == "__main__":
+    main()

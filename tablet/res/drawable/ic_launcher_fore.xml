@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Значок: планшет боком, в нём — стол (панель сверху, окно) и курсор; поле 108, видно — круг 66 в середине -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- корпус -->
+    <path
+        android:strokeColor="#ECE9E3"
+        android:strokeWidth="3"
+        android:fillColor="#2A2825"
+        android:pathData="M31,38 h46 a5,5 0 0 1 5,5 v24 a5,5 0 0 1 -5,5 h-46 a5,5 0 0 1 -5,-5 v-24 a5,5 0 0 1 5,-5 z" />
+    <!-- панель стола -->
+    <path
+        android:fillColor="#A9A49A"
+        android:pathData="M30,42 h48 v3 h-48 z" />
+    <!-- окно -->
+    <path
+        android:fillColor="#D8B25A"
+        android:pathData="M36,49 h22 a2,2 0 0 1 2,2 v12 a2,2 0 0 1 -2,2 h-22 a2,2 0 0 1 -2,-2 v-12 a2,2 0 0 1 2,-2 z" />
+    <!-- курсор -->
+    <path
+        android:fillColor="#ECE9E3"
+        android:strokeColor="#1C1B19"
+        android:strokeWidth="1.2"
+        android:strokeLineJoin="round"
+        android:pathData="M63,52 L63,67 L66.6,63.6 L69.2,69.2 L71.4,68.2 L68.8,62.8 L73.6,62.6 Z" />
+</vector>

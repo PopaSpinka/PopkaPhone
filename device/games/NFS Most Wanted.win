@@ -1,0 +1,2 @@
+# НаомиФон — игра Windows в списке игр стола (docs/WINDOWS.md): запускалка, сценарий sh
+exec "$HOME/naomi/bin/nfsmw"

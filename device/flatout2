@@ -1,0 +1,12 @@
+#!/bin/sh
+# НаомиФон — запуск FlatOut 2 на столе (docs/WINDOWS.md): на телефоне, ~/naomi/bin/flatout2. Игра стоит в префиксе
+# Wine (C:\Games\FlatOut2). DirectX 9 — DXVK (d3d9.dll из dxvk-2.4.1/x32 в windows/syswow64 префикса), шейдеры —
+# настоящая d3dx9_30.dll рядом с игрой (wine.sh d3dx9), winmm.dll игры (загрузчик её дополнений) — раньше встроенной.
+#   NAOMI_FPS=1 — счётчик кадров DXVK в углу
+#   NAOMI_RATE=N — потолок кадров в секунду (по умолчанию 30, 0 — без потолка): нагретый телефон больше 30–35 в гонке
+#   не даёт, а ровные 30 — меньше тепла и рывков (решение пользователя, 21 ноября 2026)
+cd "$HOME/.local/share/naomi/win/prefix/drive_c/Games/FlatOut2" || exit 1
+export WINEDLLOVERRIDES="d3d9,d3dx9_30=n;winmm=n,b;mscoree,mshtml="
+[ -n "${NAOMI_FPS:-}" ] && export DXVK_HUD=fps
+[ "${NAOMI_RATE:-30}" != 0 ] && export DXVK_FRAME_RATE=${NAOMI_RATE:-30}
+exec "$HOME/naomi/bin/winrun" FlatOut2.exe

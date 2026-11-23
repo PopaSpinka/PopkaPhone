@@ -1,0 +1,11 @@
+#!/bin/sh
+# НаомиФон — запуск Claude Desktop на столе (docs/CLAUDE.md). Запускает оболочка (Desktop.qml, naomiApps.run «claude»):
+# exec — тот же pid, по нему стол узнаёт окно (у Chromium в /proc/pid/environ метки NAOMI_DESK_APP нет). Рисует
+# пиксель в пиксель с кадром стола (масштаб 1: --force-device-scale-factor с дробным масштабом Chromium без протокола
+# fractional-scale объявляет поверхность вдвое меньше буфера — стол показывал не ту часть). Русские буквы — по
+# text-input-v3 (стол шлёт их текстом). «Меньше движения» (--force-prefers-reduced-motion): анимации Claude
+# выключены — рисует он процессором, и невидимая анимация перерисовывала окно ~18 раз в секунду в покое (55 % ядра;
+# с флагом 3–5 %), а переключение сеанса шло анимацией ~20 кадров/с вместо 1–3 кадров (docs/CLAUDE.md, «Скорость»).
+D=$(cd "$(dirname "$0")" && pwd)
+exec "$D/usr/lib/claude-desktop/claude-desktop" --ozone-platform=wayland \
+    --enable-wayland-ime --wayland-text-input-version=3 --force-prefers-reduced-motion "$@"

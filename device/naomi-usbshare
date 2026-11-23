@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""naomi-usbshare (phone) — boards plugged into the dock appear here as if plugged into the phone (docs/BOARDS.md).
+
+The Pi lends its ESP32 boards over the cable (pi/usbshare/naomi-usbshare, USB/IP); here vhci-hcd takes them: a board
+becomes /dev/ttyACM… with its own vendor, product and serial number (cdc-acm). The phone's kernel has none of the three
+drivers built in — the modules are ours, built for this very kernel (device/kmod.py), kept in ~/naomi/kmod/<release>/.
+Root. systemd: naomi-usbshare.service (tools/boards install).
+
+    naomi-usbshare            serve: load the drivers, take every free board of the dock, again when it comes back
+    naomi-usbshare modules    only load the drivers
+    naomi-usbshare status     the drivers, the boards taken, the dock's free ones
+    naomi-usbshare install    /usr/local/sbin/naomi-usbshare + naomi-usbshare.service, started (the root is made
+                              writable for that and read-only again)
+    naomi-usbshare uninstall
+"""
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+SELF = "/usr/local/sbin/naomi-usbshare"
+UNIT = "/etc/systemd/system/naomi-usbshare.service"
+
+DOCK = (os.environ.get("NAOMI_USBSHARE_DOCK", "10.77.0.53"), 3240)  # the Pi's fixed address on the cable
+KMOD = os.path.join("/home/phablet/naomi/kmod", os.uname().release)
+MODULES = ["cdc-acm", "usbip-core", "vhci-hcd"]  # (in this order: vhci-hcd needs usbip-core)
+VHCI = "/sys/devices/platform/vhci_hcd.0"
+VERSION = 0x0111
+REQ_DEVLIST, REP_DEVLIST = 0x8005, 0x0005
+REQ_IMPORT, REP_IMPORT = 0x8003, 0x0003
+USED = 6  # (vhci port state VDEV_ST_USED)
+DEVICE = struct.Struct(">256s32sIIIHHHBBBBBB")  # usbip_usb_device, 312 bytes
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def loaded():
+    with open("/proc/modules") as f:
+        return {line.split()[0] for line in f}
+
+
+def load_modules():
+    have = loaded()
+    for m in MODULES:
+        if m.replace("-", "_") in have:
+            continue
+        path = os.path.join(KMOD, m + ".ko")
+        r = subprocess.run(["insmod", path], capture_output=True, text=True)
+        if r.returncode:
+            log(f"{m}: not loaded — {r.stderr.strip() or r.returncode} ({path})")
+            return False
+        log(f"{m}: loaded")
+    return True
+
+
+def ports():
+    """vhci ports -> (hub, port, state, devid hex, local busid)."""
+    out = []
+    with open(f"{VHCI}/status") as f:
+        for line in f.read().splitlines()[1:]:
+            p = line.split()
+            if len(p) >= 7:
+                out.append((p[0], int(p[1]), int(p[2]), p[4], p[6]))
+    return out
+
+
+def recv_all(conn, n):
+    buf = b""
+    while len(buf) < n:
+        part = conn.recv(n - len(buf))
+        if not part:
+            raise ConnectionError("closed")
+        buf += part
+    return buf
+
+
+def ask(code, body=b""):
+    conn = socket.create_connection(DOCK, timeout=2)
+    conn.sendall(struct.pack(">HHI", VERSION, code, 0) + body)
+    return conn
+
+
+def dock_boards():
+    """The dock's free boards: [(busid, vid, pid, speed)]."""
+    with ask(REQ_DEVLIST) as conn:
+        _, code, status, n = struct.unpack(">HHII", recv_all(conn, 12))
+        out = []
+        for _ in range(n):
+            d = DEVICE.unpack(recv_all(conn, DEVICE.size))
+            recv_all(conn, 4 * d[13])  # (its interfaces)
+            out.append((d[1].split(b"\0")[0].decode(), d[5], d[6], d[4]))
+        return out
+
+
+def take(busid):
+    """Import one board and give it to a free vhci port. -> its port, or None."""
+    conn = ask(REQ_IMPORT, struct.pack("32s", busid.encode()))
+    try:
+        _, code, status = struct.unpack(">HHI", recv_all(conn, 8))
+        if code != REP_IMPORT or status:
+            log(f"{busid}: the dock refused ({status})")
+            return None
+        d = DEVICE.unpack(recv_all(conn, DEVICE.size))
+        busnum, devnum, speed, vid, pid = d[2], d[3], d[4], d[5], d[6]
+        hub = "ss" if speed >= 5 else "hs"
+        free = [p for h, p, state, _, _ in ports() if h == hub and state == 4]
+        if not free:
+            log(f"{busid}: no free {hub} port")
+            return None
+        # the kernel keeps the socket while the board is here: a cable pulled out must end it in ~11 s of silence
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5)
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 2)
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        with open(f"{VHCI}/attach", "w") as f:
+            f.write(f"{free[0]} {conn.fileno()} {(busnum << 16) | devnum} {speed}")
+        log(f"{busid} ({vid:04x}:{pid:04x}): taken, port {free[0]}")
+        return free[0]
+    finally:
+        conn.close()  # (vhci holds the socket itself)
+
+
+def serve():
+    if not load_modules():
+        sys.exit(1)
+    mine = {}  # port -> the dock's busid
+    reachable = None
+    while True:
+        busy = {p for _, p, state, _, _ in ports() if state == USED}
+        for port in [p for p in mine if p not in busy]:
+            log(f"{mine.pop(port)}: gone (port {port})")
+        try:
+            free = dock_boards()
+            if reachable is not True:
+                log("dock: reachable")
+            reachable = True
+            for busid, vid, pid, speed in free:
+                if busid not in mine.values():
+                    port = take(busid)
+                    if port is not None:
+                        mine[port] = busid
+        except (OSError, ConnectionError, struct.error) as e:
+            if reachable is not False:
+                log(f"dock: not reachable ({e})")
+            reachable = False
+        time.sleep(2)
+
+
+def status():
+    have = loaded()
+    print("drivers:", ", ".join(f"{m} {'yes' if m.replace('-', '_') in have else 'no'}" for m in MODULES))
+    if os.path.exists(VHCI):
+        for hub, port, state, devid, local in ports():
+            if state == USED:
+                print(f"port {hub} {port}: board {local} (devid {devid})")
+    try:
+        for busid, vid, pid, speed in dock_boards():
+            print(f"dock: {busid} {vid:04x}:{pid:04x} free")
+    except (OSError, ConnectionError, struct.error) as e:
+        print(f"dock: not reachable ({e})")
+
+
+def writable(change):
+    """The root is read-only: writable for change(), then read-only again."""
+    subprocess.run(["mount", "-o", "remount,rw", "/"], check=True)
+    try:
+        change()
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
+    finally:
+        subprocess.run(["sync"])
+        if subprocess.run(["mount", "-o", "remount,ro", "/"]).returncode:
+            print("warning: the root stayed writable", file=sys.stderr)
+
+
+def install():
+    def put():
+        shutil.copy(os.path.abspath(__file__), SELF)
+        os.chmod(SELF, 0o755)
+        with open(UNIT, "w") as f:
+            f.write("# NaomiPhone: boards plugged into the dock, here (device/naomi-usbshare, docs/BOARDS.md)\n[Unit]\n"
+                    "Description=NaomiPhone: ESP32 boards of the dock (USB/IP)\nAfter=local-fs.target naomi-usb.service\n"
+                    "\n[Service]\nExecStart=/usr/bin/python3 " + SELF + " serve\nRestart=always\nRestartSec=5\n\n"
+                    "[Install]\nWantedBy=multi-user.target\n")
+    subprocess.run(["systemctl", "stop", "naomi-usbshare"], capture_output=True)
+    writable(put)
+    subprocess.run(["systemctl", "enable", "-q", "--now", "naomi-usbshare"], check=True)
+    print("installed: naomi-usbshare (boards of the dock, here)")
+
+
+def uninstall():
+    subprocess.run(["systemctl", "disable", "-q", "--now", "naomi-usbshare"], check=False)
+    writable(lambda: [os.remove(f) for f in (UNIT, SELF) if os.path.exists(f)])
+    print("removed: naomi-usbshare (the drivers stay loaded until a reboot)")
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
+    {"serve": serve, "modules": lambda: sys.exit(0 if load_modules() else 1), "status": status,
+     "install": install, "uninstall": uninstall}[cmd]()

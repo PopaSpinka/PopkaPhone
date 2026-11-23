@@ -1,0 +1,14 @@
+#!/bin/sh
+# НаомиФон — xdg-open стола (docs/CLAUDE.md, «Ссылки»): своего xdg-open в Ubuntu Touch нет. Адрес http(s) — браузеру
+# стола новой вкладкой (оболочка: org.naomi.Web.Open, web_link.h; браузера нет — стол запустит его); остальное (файлы,
+# mailto, claude://) не умеет — код 3, как у xdg-open «не вышло». Стоит в /usr/local/bin/xdg-open (device/claude.sh):
+# Claude ищет xdg-open только в системных папках, принадлежащих root и закрытых на запись.
+case "$1" in
+http://* | https://*)
+    exec gdbus call --session --dest org.naomi.Web --object-path /web --method org.naomi.Web.Open "$1" >/dev/null
+    ;;
+*)
+    echo "xdg-open (НаомиФон): открываю только http и https, не «$1»" >&2
+    exit 3
+    ;;
+esac

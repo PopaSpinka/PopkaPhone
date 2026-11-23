@@ -1,0 +1,90 @@
+{
+ "format": "naomiphone/1",
+ "device": "pixel5",
+ "name": "По умолчанию",
+ "apps": [
+  {
+   "id": "settings",
+   "title": "Настройки",
+   "sub": "",
+   "icon": "settings",
+   "to": "settings"
+  }
+ ],
+ "functions": {},
+ "screens": [
+  {
+   "id": "home",
+   "name": "Home",
+   "x": 0,
+   "y": 0,
+   "layers": [
+    {
+     "id": "apps1",
+     "type": "apps",
+     "name": "Apps",
+     "hidden": false,
+     "dx": 0,
+     "dy": 26,
+     "tap": null,
+     "color": "#FFFFFF",
+     "color2": "#FFFFFF"
+    },
+    {
+     "id": "shade1",
+     "type": "shade",
+     "name": "Shade",
+     "hidden": false,
+     "dx": 0,
+     "dy": 0,
+     "tap": null
+    },
+    {
+     "id": "clock1",
+     "type": "clock",
+     "name": "Clock",
+     "hidden": false,
+     "dx": 8,
+     "dy": -69,
+     "tap": null,
+     "size": 125,
+     "weight": 220,
+     "color": "#D4D4D4"
+    },
+    {
+     "id": "battery1",
+     "type": "battery",
+     "name": "Battery",
+     "hidden": false,
+     "dx": 114,
+     "dy": -228,
+     "tap": null,
+     "color": "#B9B3A7",
+     "color2": "#FFFFFF",
+     "look": "line",
+     "scale": 1
+    }
+   ]
+  },
+  {
+   "id": "settings",
+   "name": "Настройки",
+   "x": 600,
+   "y": 0,
+   "layers": [
+    {
+     "id": "settings-app",
+     "type": "app",
+     "name": "App",
+     "hidden": false,
+     "dx": 0,
+     "dy": 0,
+     "tap": null,
+     "icon": "settings",
+     "title": "Настройки"
+    }
+   ]
+  }
+ ],
+ "rev": 1
+}

@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""НаомиФон — образы для прошивки Pixel 5 (docs/INSTALL.md): скачать, чего нет, и сверить SHA-256.
+
+  tools/images          заводской Android 13 (Google, 2,4 ГБ) и сборка порта Ubuntu Touch (GitLab автора порта,
+                        886 МБ; распакованный ubuntu.img — 3,5 ГБ) → images/ (не в git); готовит SHA256SUMS,
+                        которые проверяет tools/flash.sh. Что уже скачано и сошлось — не трогает.
+
+Нужны curl, unzip и zstd. GitLab скачивание скриптом пускает не всегда (отвечает 429): тогда скачайте архив
+браузером по ссылке, которую покажет команда, положите его как images/port-ci-16320685262/artifacts.zip и
+запустите снова.
+"""
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+IMAGES = os.path.join(ROOT, "images")
+
+FACTORY = ("factory/redfin-tq3a.230901.001-factory-308061bf.zip",
+           "https://dl.google.com/dl/android/aosp/redfin-tq3a.230901.001-factory-308061bf.zip",
+           "308061bf6961ade40cae773395e01e5ca05fc8ebb554d4c56c42057b1022ec2e")
+# Порт Ubuntu Touch для Pixel 5: https://gitlab.com/dadrickpistachio/google-redfin, задание CI devel-flashable
+# №16320685262 (коммит d57e104e, 4 сентября 2026) — та сборка, на которой всё проверено
+PORT_DIR = "port-ci-16320685262"
+PORT = (PORT_DIR + "/artifacts.zip",
+        "https://gitlab.com/dadrickpistachio/google-redfin/-/jobs/16320685262/artifacts/download",
+        "7425f6527ab0d242dd349d82ca5bb7ab90ea67262a56304b05fcf63047f139db")
+PORT_PAGE = "https://gitlab.com/dadrickpistachio/google-redfin/-/jobs/16320685262"
+PORT_SUMS = {
+    "boot.img": "6211874b94e75515fe995d4001bf631e6071dac327ffb9542ba86fae0f171cdf",
+    "vendor_boot.img": "fc03fc6cd5ca3c710c3caacf3929fb9d5493319d40bbc85c3e933382e50408e9",
+    "dtbo.img": "1402b9c0d01e16544178ed67ca82557b1d7b8e214b42bf80c0b61935d56a13c4",
+    "ubuntu.img": "cbb25fb305b2b3a2f6a0b69869a77b91e7858081d96016d54b082539ff92fc6d",
+}
+
+
+def die(msg):
+    sys.exit("images: " + msg)
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def get(rel, url, sha, hint=None):
+    """файл есть и сумма та — ничего; нет — скачать (curl, с продолжением) и сверить"""
+    path = os.path.join(IMAGES, rel)
+    if not os.path.isfile(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        print(f"скачиваю {rel} ← {url}", flush=True)
+        r = subprocess.run(["curl", "-fL", "--retry", "2", "-C", "-", "-o", path + ".part", url])
+        if r.returncode:
+            die(f"не скачалось ({url})." + (f"\n  {hint}" if hint else ""))
+        os.replace(path + ".part", path)
+    print(f"сверяю {rel} …", flush=True)
+    if sha256(path) != sha:
+        die(f"SHA-256 не совпал: {path} — удалите файл и повторите")
+    return path
+
+
+def main():
+    if len(sys.argv) > 1:
+        print(__doc__.strip())
+        return
+    for tool in ("curl", "unzip", "zstd"):
+        if not shutil.which(tool):
+            die(f"нет программы {tool}")
+    get(*FACTORY)
+    out = os.path.join(IMAGES, PORT_DIR, "out")
+    ready = all(os.path.isfile(os.path.join(out, name)) for name in PORT_SUMS)
+    if not ready:
+        zip_path = get(*PORT, hint=f"Скачайте браузером: {PORT_PAGE} → кнопка «Download» у артефактов задания — и положите как "
+                                   f"{os.path.join(IMAGES, PORT[0])}")
+        subprocess.run(["unzip", "-o", "-q", zip_path, "-d", os.path.join(IMAGES, PORT_DIR)], check=True)
+        zst = os.path.join(out, "ubuntu.img.zst")
+        if os.path.isfile(zst) and not os.path.isfile(os.path.join(out, "ubuntu.img")):
+            print("распаковываю ubuntu.img (3,5 ГБ) …", flush=True)
+            subprocess.run(["zstd", "-d", "-q", "--rm", zst], check=True)
+    for name, sha in PORT_SUMS.items():
+        path = os.path.join(out, name)
+        if not os.path.isfile(path):
+            die(f"в архиве порта нет {name}")
+        print(f"сверяю {PORT_DIR}/out/{name} …", flush=True)
+        if sha256(path) != sha:
+            die(f"SHA-256 не совпал: {path}")
+    with open(os.path.join(out, "SHA256SUMS"), "w") as f:
+        f.write("".join(f"{sha}  {name}\n" for name, sha in PORT_SUMS.items()))
+    print(f"готово: заводской образ и порт сошлись.\n  tools/flash.sh stock\n  tools/flash.sh ubuntu images/{PORT_DIR}/out")
+
+
+if __name__ == "__main__":
+    main()

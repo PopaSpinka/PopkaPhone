@@ -1,0 +1,335 @@
+#!/bin/sh
+# НаомиФон — кабель разработчика: ADB и сеть по USB, всегда, без переключения режимов
+# (docs/DEVELOPMENT.md, «Кабель»). Заменяет usb-moded: тот ждал разблокировки от Lomiri и, не успев
+# поднять ADB, сам уходил в «только зарядку».
+#
+#   sudo sh naomi-usb install     поставить: /usr/local/sbin/naomi-usb, служба naomi-usb, usb-moded — выкл.
+#   sudo sh naomi-usb uninstall   вернуть usb-moded
+#   naomi-usb status              что сейчас на кабеле
+#   naomi-usb up                  (служба) собрать гаджет: NCM + место под ADB, ещё не подключён
+#   naomi-usb bind [сек]          (служба, adbd) подключить гаджет: с ADB, если adbd готов (ждать до
+#                                 сек), иначе только сеть
+#   naomi-usb later               (adbd остановился) через 3 с — bind 0, если adbd не вернулся
+#   naomi-usb add|old|del …       (dnsmasq, --dhcp-script) аренда адреса на кабеле: приставка — интернет через неё
+#   naomi-usb check               (таймер naomi-usb-check, раз в минуту, пока приставка на кабеле) есть ли через
+#                                 неё интернет: есть — маршрут через кабель, нет — убрать, интернет по Wi-Fi
+#   naomi-usb internet on|off     (naomid, выключатель окна «Интернет» стола) интернет по кабелю разрешён или нет:
+#                                 off — маршрут через приставку прочь, интернет по Wi-Fi; картинка стола — по-прежнему
+#                                 по кабелю. До перезагрузки (/run): помнит выбор стол и ставит его снова
+#
+# Гаджет g1 (имя ждёт adbd-functionfs.sh из Ubuntu Touch): функции ncm.usb0 — сеть CDC-NCM, её macOS
+# понимает без драйверов, и ffs.adb — ADB через FunctionFS. ADB может подключиться только после того,
+# как adbd записал описание своих точек (появился /dev/usb-ffs/adb/ep1), а когда adbd закрывается,
+# ядро отключает весь гаджет — поэтому подключает его заново хук adbd (adbd.service.d/90-naomi-usb.conf):
+# при старте — с ADB; при остановке — через 3 с только сеть, если adbd так и не вернулся (при обычном
+# перезапуске adbd гаджет не мигает лишний раз). Сеть: телефон всегда 10.77.0.1/24, Mac получает адрес
+# по DHCP (dnsmasq без шлюза и DNS — интернет Mac через телефон не идёт). Адрес Mac бывает разным:
+# MAC-адрес Mac-стороны ядро (Android 4.19) выдумывает заново при каждом подключении гаджета, а задать
+# его заранее не даёт.
+#
+# Интернет по кабелю (docs/PI.md, «Интернет по кабелю»): на кабеле приставка — аренда DHCP с именем naomi-pi, а не
+# Mac, — и через неё есть интернет (Pi пересылает и подменяет адрес, tools/pi install) — маршрут в интернет через неё,
+# главнее Wi-Fi (метрика 100 против 600 у NetworkManager). Wi-Fi остаётся: по нему запасной путь стола (кабель вынули —
+# картинка не пропадает) и DNS. Кабель вынут — ядро маршрут через него не считает (ignore_routes_with_linkdown),
+# интернет сразу по Wi-Fi; вставлен — снова кабель. Что уже идёт с адреса кабеля (и проверка) — через таблицу 77.
+# DNS: приставка отвечает сама (10.77.0.53, tools/pi install) — она второй источник у dnsmasq NetworkManager рядом с
+# роутером по Wi-Fi, вопрос — обоим сразу (all-servers), берётся первый ответ: с выключенным Wi-Fi имена находит
+# приставка, кабель вынули — роутер, без ожидания мёртвого источника. Интернет по кабелю выключен — к 10.77.0.53 пути
+# нет (unreachable): и DNS не по кабелю. Адреса на кабеле по DHCP — с .100: .2–.99 — постоянные (.53 — приставки).
+set -eu
+
+G=/sys/kernel/config/usb_gadget/g1
+C=$G/configs/c.1
+FFS=/dev/usb-ffs/adb
+ADDR=10.77.0.1/24
+SELF=/usr/local/sbin/naomi-usb
+UNITS=/etc/systemd/system
+GW=/run/naomi-usb/gateway       # адрес приставки на кабеле, пока у неё аренда
+TABLE=77                        # маршрут через приставку для пакетов с адреса кабеля (уже идущих по нему, проверки)
+METRIC=100                      # главнее Wi-Fi: NetworkManager ставит ему 600
+# свои маршруты — с меткой static: Ubuntu Touch на каждое событие NetworkManager (Wi-Fi вкл / выкл, продление адреса)
+# стирает все маршруты с меткой boot (dispatcher.d/02default_route_workaround), а её ставит ip route без метки
+PROTO=static
+PROBE="1.1.1.1 8.8.8.8"         # есть ли интернет через приставку — хоть один ответил на пинг
+DNS=10.77.0.53                  # DNS приставки (постоянный адрес на её стороне кабеля)
+NMDNS=/etc/NetworkManager/dnsmasq.d/90-naomi-dock.conf
+OFF=/run/naomi-usb/internet-off # интернет по кабелю выключен (naomi-usb internet off)
+
+log() { echo "naomi-usb: $*" >&2; }
+
+serial() { tr ' ' '\n' < /proc/cmdline | sed -n 's/^androidboot.serialno=//p'; }
+
+up() {
+    mkdir -p $G
+    [ -z "$(cat $G/UDC)" ] || echo "" > $G/UDC || true   # бывает «I/O error», но отключается
+    echo 0x18d1 > $G/idVendor
+    echo 0x4ee4 > $G/idProduct         # как у «сеть + ADB» в настройках порта
+    echo 0xEF > $G/bDeviceClass        # составное устройство с IAD: так его ждёт драйвер NCM
+    echo 0x02 > $G/bDeviceSubClass
+    echo 0x01 > $G/bDeviceProtocol
+    mkdir -p $G/strings/0x409 $C/strings/0x409
+    serial > $G/strings/0x409/serialnumber
+    echo Google > $G/strings/0x409/manufacturer
+    echo "Pixel 5 NaomiPhone" > $G/strings/0x409/product
+    echo "adb+ncm" > $C/strings/0x409/configuration
+    # от usb-moded и прошлых запусков: ссылки в конфигурации и лишние функции (RNDIS держит имя usb0)
+    for l in $C/*; do [ ! -L "$l" ] || rm "$l"; done
+    for f in $G/functions/*; do
+        case ${f##*/} in ncm.usb0|ffs.adb|\*) ;; *) rmdir "$f" 2>/dev/null || log "не убрать ${f##*/}" ;; esac
+    done
+    # MAC-адреса NCM не задаём: в этом ядре (Android 4.19) их файлы недоступны до подключения гаджета
+    mkdir -p $G/functions/ncm.usb0 $G/functions/ffs.adb
+    ln -s $G/functions/ncm.usb0 $C/
+    log "гаджет собран: NCM, место под ADB"
+}
+
+bind() {  # $1 — сколько секунд ждать adbd
+    n=$(( ${1:-0} * 20 ))
+    while [ ! -e $FFS/ep1 ] && [ "$n" -gt 0 ]; do sleep 0.05; n=$((n - 1)); done
+    want=net; [ ! -e $FFS/ep1 ] || want=adb
+    have=net; [ ! -L $C/ffs.adb ] || have=adb
+    if [ -n "$(cat $G/UDC)" ] && [ $have = $want ]; then
+        return 0
+    fi
+    [ -z "$(cat $G/UDC)" ] || echo "" > $G/UDC || true   # бывает «I/O error», но отключается
+    if [ $want = adb ]; then
+        [ -L $C/ffs.adb ] || ln -s $G/functions/ffs.adb $C/
+    else
+        rm -f $C/ffs.adb
+    fi
+    if ! ls /sys/class/udc > $G/UDC 2>/dev/null; then
+        [ $want = adb ] || { log "гаджет не подключить"; exit 1; }
+        log "с ADB не подключить — только сеть"
+        rm -f $C/ffs.adb
+        want=net
+        ls /sys/class/udc > $G/UDC
+    fi
+    # сетевой интерфейс появляется при первом подключении гаджета
+    ifname=$(cat $G/functions/ncm.usb0/ifname)
+    ip -4 addr show dev "$ifname" | grep -q "inet $ADDR" || ip addr replace $ADDR dev "$ifname"
+    # кабель вынут (нет несущей) — маршруты через него ядро не считает: интернет сразу по Wi-Fi
+    echo 1 > /proc/sys/net/ipv4/conf/"$ifname"/ignore_routes_with_linkdown
+    ip link set "$ifname" up
+    log "на кабеле: $([ $want = adb ] && echo "ADB и сеть" || echo "только сеть (adbd не готов)"), $ifname $ADDR"
+}
+
+later() {
+    systemd-run --quiet --collect --unit=naomi-usb-later --on-active=3 --timer-property=AccuracySec=100ms \
+        $SELF bind 0 2>/dev/null || true
+}
+
+usbif() { cat $G/functions/ncm.usb0/ifname 2>/dev/null || echo usb0; }
+
+# dnsmasq — при каждой аренде на кабеле: add|old|del MAC адрес [имя]; init — выдать сохранённые аренды (их нет)
+lease() {
+    case "$1" in
+    add|old)
+        [ "${4:-}" = naomi-pi ] || return 0
+        mkdir -p ${GW%/*}
+        [ "$(cat $GW 2>/dev/null)" = "$3" ] || log "на кабеле приставка ($3) — проверяю интернет через неё"
+        echo "$3" > $GW
+        gateway_up "$3"
+        systemctl --no-block start naomi-usb-check.service naomi-usb-check.timer ;;
+    del)
+        [ "$(cat $GW 2>/dev/null)" = "$3" ] || return 0
+        gateway_down
+        log "приставка ушла с кабеля — интернет по Wi-Fi" ;;
+    esac
+}
+
+# маршрут через приставку — для пакетов с адреса кабеля (правила 1077–1078: свои подсети — как обычно, остальное —
+# таблица 77); главный маршрут в интернет ставит check, когда проверка прошла
+gateway_up() {
+    ifname=$(usbif)
+    echo 1 > /proc/sys/net/ipv4/conf/"$ifname"/ignore_routes_with_linkdown
+    ip route replace default via "$1" dev "$ifname" table $TABLE proto $PROTO
+    if ! ip rule show pref 1078 | grep -q .; then
+        ip rule add pref 1077 from ${ADDR%/*} lookup main suppress_prefixlength 0
+        ip rule add pref 1078 from ${ADDR%/*} lookup $TABLE
+    fi
+}
+
+gateway_down() {
+    ifname=$(usbif)
+    rm -f $GW
+    systemctl --no-block stop naomi-usb-check.timer 2>/dev/null || true
+    ip route del default dev "$ifname" metric $METRIC 2>/dev/null || true
+    ip route flush table $TABLE 2>/dev/null || true
+    ip rule del pref 1077 2>/dev/null || true
+    ip rule del pref 1078 2>/dev/null || true
+}
+
+check() {
+    [ -f $GW ] || return 0
+    gw=$(cat $GW)
+    ifname=$(usbif)
+    if [ -f $OFF ]; then   # выключен — маршрута в интернет через кабель нет
+        ip route del default dev "$ifname" metric $METRIC 2>/dev/null || true
+        return 0
+    fi
+    [ "$(cat /sys/class/net/"$ifname"/carrier 2>/dev/null)" = 1 ] || return 0   # вынут: маршрут и так не в счёт
+    ok=0
+    for a in $PROBE; do
+        if ping -q -n -c 1 -W 2 -I ${ADDR%/*} "$a" > /dev/null 2>&1; then ok=1; break; fi
+    done
+    have=0
+    if ip route show default dev "$ifname" | grep -q .; then have=1; fi
+    if [ $ok = 1 ] && [ $have = 0 ]; then
+        ip route replace default via "$gw" dev "$ifname" metric $METRIC proto $PROTO
+        log "интернет — по кабелю, через приставку $gw"
+    elif [ $ok = 0 ] && [ $have = 1 ]; then
+        ip route del default dev "$ifname" metric $METRIC 2>/dev/null || true
+        log "через приставку интернета нет — интернет по Wi-Fi (проверю снова через минуту)"
+    fi
+}
+
+internet() {
+    mkdir -p ${OFF%/*}
+    case "${1:-}" in
+    off)
+        [ -f $OFF ] || log "интернет по кабелю выключен — по Wi-Fi"
+        touch $OFF
+        ip route del default dev "$(usbif)" metric $METRIC 2>/dev/null || true
+        ip route replace unreachable $DNS/32 proto $PROTO ;;
+    on)
+        [ ! -f $OFF ] || log "интернет по кабелю включён — проверяю приставку"
+        rm -f $OFF
+        ip route del unreachable $DNS/32 2>/dev/null || true
+        [ ! -f $GW ] || systemctl --no-block start naomi-usb-check.service ;;
+    *) echo "использование: $0 internet on|off" >&2; exit 2 ;;
+    esac
+}
+
+status() {
+    if [ ! -d $G ]; then echo "гаджета нет"; return; fi
+    echo "UDC: $(cat $G/UDC)  $(cat $G/idVendor):$(cat $G/idProduct)  функции: $(ls $C | grep '\.' | tr '\n' ' ')"
+    ifname=$(cat $G/functions/ncm.usb0/ifname 2>/dev/null || echo "?")
+    ip -br addr show dev "$ifname" 2>/dev/null || echo "интерфейса $ifname нет"
+    echo "adbd: $(systemctl is-active adbd.service)  naomi-usb: $(systemctl is-active naomi-usb.service)" \
+         " usb-moded: $(systemctl is-enabled usb-moded.service 2>/dev/null || true)"
+    if [ -f $OFF ]; then
+        echo "интернет: по Wi-Fi — по кабелю выключен (naomi-usb internet on — включить)"
+    elif [ -f $GW ]; then
+        if ip route show default dev "$ifname" | grep -q .; then
+            echo "интернет: по кабелю, через приставку $(cat $GW)"
+        else
+            echo "интернет: по Wi-Fi (приставка $(cat $GW) на кабеле, но интернета через неё нет)"
+        fi
+    else
+        echo "интернет: не через кабель (приставки на нём нет)"
+    fi
+}
+
+nmdns_reload() {   # dnsmasq NetworkManager — заново (NetworkManager запускает его сам, с новыми настройками)
+    nmcli general reload dns-full 2>/dev/null || kill "$(cat /run/NetworkManager/dnsmasq.pid 2>/dev/null)" 2>/dev/null || true
+}
+
+rw() {
+    mount -o remount,rw /
+    trap 'sync; mount -o remount,ro / || log "внимание: корень остался на запись"' EXIT
+}
+
+install_() {
+    [ "$(id -u)" = 0 ] || { log "нужен root"; exit 1; }
+    rw
+    install -m 755 "$0" $SELF
+    cat > $UNITS/naomi-usb.service <<'EOF'
+# НаомиФон — кабель разработчика: ADB и сеть по USB (device/naomi-usb, docs/DEVELOPMENT.md)
+[Unit]
+Description=NaomiPhone USB: ADB and network over the cable
+After=sys-kernel-config.mount
+Before=adbd.service adbd-prepare.service
+Wants=adbd.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/sbin/naomi-usb up
+# DHCP для Mac и приставки: без шлюза (option 3) и DNS (option 6), аренды только в памяти; DNS выключен. Каждая
+# аренда — naomi-usb add|old|del: приставка на кабеле — интернет через неё
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/dev/null --port=0 --interface=usb* \
+    --bind-dynamic --dhcp-range=10.77.0.100,10.77.0.254,255.255.255.0,1h --dhcp-option=3 \
+    --dhcp-option=6 --dhcp-authoritative --leasefile-ro --pid-file= --log-facility=- \
+    --dhcp-script=/usr/local/sbin/naomi-usb
+# гаджет подключают хуки adbd (90-naomi-usb.conf): с ADB, а если adbd нет — только сеть
+ExecStartPost=/bin/systemctl --no-block restart adbd.service
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    mkdir -p $UNITS/adbd.service.d
+    cat > $UNITS/adbd.service.d/90-naomi-usb.conf <<'EOF'
+# НаомиФон: гаджет USB подключается заново при каждом старте и остановке adbd (device/naomi-usb)
+[Service]
+ExecStartPost=-/usr/local/sbin/naomi-usb bind 5
+ExecStopPost=-/usr/local/sbin/naomi-usb later
+Restart=always
+RestartSec=1
+EOF
+    cat > $UNITS/naomi-usb-check.service <<'EOF'
+# НаомиФон — есть ли интернет через приставку на кабеле (device/naomi-usb check)
+[Unit]
+Description=NaomiPhone USB: internet through the dock
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/naomi-usb check
+EOF
+    cat > $UNITS/naomi-usb-check.timer <<'EOF'
+# НаомиФон — проверка интернета через приставку раз в минуту, пока она на кабеле (ставит и снимает naomi-usb)
+[Unit]
+Description=NaomiPhone USB: check internet through the dock every minute
+
+[Timer]
+OnActiveSec=60
+OnUnitActiveSec=60
+AccuracySec=5s
+EOF
+    # DNS через приставку — источником у dnsmasq NetworkManager (он читает dnsmasq.d только при запуске — перезапустить)
+    printf '# НаомиФон: DNS через приставку по кабелю (device/naomi-usb, docs/PI.md «Интернет по кабелю»)\nserver=%s\nall-servers\n' \
+        $DNS > $NMDNS
+    nmdns_reload
+    systemctl mask usb-moded.service >/dev/null 2>&1
+    systemctl daemon-reload
+    systemctl stop usb-moded.service 2>/dev/null   # у выключенного с drop-in — ложное «changed on disk»
+    systemctl enable naomi-usb.service >/dev/null 2>&1
+    systemctl restart naomi-usb.service
+    echo "установлено: naomi-usb (ADB и сеть по кабелю), usb-moded выключен"
+}
+
+uninstall_() {
+    [ "$(id -u)" = 0 ] || { log "нужен root"; exit 1; }
+    rw
+    systemctl disable --now naomi-usb.service >/dev/null 2>&1 || true
+    gateway_down
+    rm -f $UNITS/naomi-usb.service $UNITS/naomi-usb-check.service $UNITS/naomi-usb-check.timer \
+          $UNITS/adbd.service.d/90-naomi-usb.conf $NMDNS
+    ip route del unreachable $DNS/32 2>/dev/null || true
+    nmdns_reload
+    rmdir $UNITS/adbd.service.d 2>/dev/null || true
+    systemctl daemon-reload
+    if [ -d $G ]; then
+        [ -z "$(cat $G/UDC)" ] || echo "" > $G/UDC
+        rm -f $C/ncm.usb0 $C/ffs.adb
+        rmdir $G/functions/ncm.usb0 2>/dev/null || true
+    fi
+    rm -f $SELF
+    systemctl unmask usb-moded.service >/dev/null 2>&1
+    systemctl start usb-moded.service
+    systemctl restart adbd.service || true
+    echo "убрано; USB снова ведёт usb-moded"
+}
+
+case "${1:-}" in
+up) up ;;
+bind) bind "${2:-0}" ;;
+later) later ;;
+add|old|del|init|tftp) lease "$@" ;;
+check) check ;;
+internet) internet "${2:-}" ;;
+status) status ;;
+install) install_ ;;
+uninstall) uninstall_ ;;
+*) echo "использование: $0 install|uninstall|status|up|bind [сек]|later" >&2; exit 2 ;;
+esac

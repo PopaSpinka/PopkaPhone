@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""НаомиФон — команды с Mac для приставки на Raspberry Pi 5 (docs/PI.md).
+
+  tools/pi ssh [команда]     SSH на Pi (naomi@naomi-pi.local, ключ private/ssh)
+  tools/pi build             отправить pi/, протокол и перевод клавиш (shell/stream/stream_protocol.h, key_layout.h) на Pi (~/naomi-pi/src)
+                             и собрать там → ~/naomi-pi/build/naomi-dock
+  tools/pi try [сек]         запустить приёмник на столько секунд (по умолчанию 20) прямо в SSH — журнал сюда;
+                             служба на это время остановлена; NAOMI_DOCK_TRACE и др. — через PI_ENV="K=V …"
+  tools/pi install           служба naomi-dock: приёмник с включения Pi, перезапуск при сбое (systemd); модуль
+                             i2c-dev с включения — шина DDC монитора (яркость: приглушение без дока); правило udev —
+                             сеть по кабелю телефона (cdc_ncm) шлёт мелкие пакеты сразу (такты, ввод, подтверждения);
+                             служба naomi-dock-nat — интернет телефону по кабелю (пересылка и NAT в сеть Pi),
+                             naomi-dock-dns — DNS ему же (10.77.0.53, профиль NetworkManager naomi-phone),
+                             naomi-dock-bt — после запуска Bluetooth позвать свои клавиатуры и трекпады
+                             (pi/tools/bt-input.sh connect; нужен tools/pi build — скрипт из ~/naomi-pi/src)
+  tools/pi phone             познакомить Pi с телефоном (один раз и после каждой перепрошивки телефона): свой ключ Pi
+                             (~/.ssh/naomi_stream, создаётся на Pi и его не покидает) — на телефон, с запретами: им
+                             можно только открыть поток трансляции; ключ хоста телефона — на Pi (known_hosts_phone);
+                             телефон в это время должен отвечать tools/naomi (кабель к компьютеру или Wi-Fi)
+  tools/pi pair [адрес]      спарить с Pi клавиатуру, мышь или трекпад Bluetooth (docs/PI.md, «Трекпад»): ждёт его в
+                             поиске до 5 минут — выключите и включите его, — спаривает с сохранением ключа, делает
+                             доверенным и подключает; с адресом — это устройство заново, без — первое новое
+  tools/pi desk [ШxВ@М]      стол службы поверх «Настроек» → «Экран» (разведка): Ш×В точек, М пикселей кадра в
+                             точке (docs/PI.md, «Размер и масштаб») — запомнить (/etc/naomi-dock.env) и
+                             перезапустить; без значения — что сейчас; «-» — снова по настройкам стола
+  tools/pi fonts             шрифты часов без дока (Google Sans Flex, Google Sans — как у телефона, сверка SHA-256
+                             по tools/naomi) из downloads/fonts → /usr/local/share/fonts/naomi на Pi
+  tools/pi uninstall         убрать службу
+  tools/pi run [сек]         перезапустить службу; с числом — показать журнал столько секунд
+  tools/pi stop              остановить службу
+  tools/pi log [строк]       журнал службы
+
+Pi — NAOMI_PI_HOST или naomi-pi.local; ключ хоста Pi — private/ssh/known_hosts_pi.
+"""
+import os
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HOST = os.environ.get("NAOMI_PI_HOST", "naomi-pi.local")
+SSH = ["ssh", "-i", os.path.join(ROOT, "private", "ssh", "naomiphone_ed25519"), "-o", "IdentitiesOnly=yes",
+       "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new",
+       "-o", f"UserKnownHostsFile={os.path.join(ROOT, 'private', 'ssh', 'known_hosts_pi')}"]
+SRC, BUILD = "naomi-pi/src", "naomi-pi/build"
+BIN = f"/home/naomi/{BUILD}/naomi-dock"
+UNIT = f"""[Unit]
+Description=НаомиФон — приставка: рабочий стол телефона на мониторе (docs/PI.md)
+After=network.target
+
+[Service]
+EnvironmentFile=-/etc/naomi-dock.env
+ExecStart={BIN}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+"""
+# Сеть по кабелю (CDC-NCM): драйвер Pi копит мелкие пакеты до 400 мкс, чтобы уложить несколько в одну посылку USB, —
+# такты и ввод к телефону и подтверждения TCP на видео ждали этот срок. 5 мкс (меньше драйвер не даёт): пинг
+# Pi → телефон 1,70 → 0,51 мс, такт до кадра телефона 2,5 → 1,8 мс, кадр по кабелю 0,9–1,1 → 0,5 мс, весь путь
+# от такта до распакованного 24,6–24,8 → 23,6–23,8 мс (19 ноября 2026, docs/PI.md, «Срок отдачи и кабель»)
+NCM_RULE = 'ACTION=="add", SUBSYSTEM=="net", DRIVERS=="cdc_ncm", ATTR{cdc_ncm/tx_timer_usecs}="5"'
+NCM_RULE_FILE = "/etc/udev/rules.d/71-naomi-dock-ncm.rules"
+# Интернет телефону по кабелю (docs/PI.md, «Интернет по кабелю»): Pi пересылает пакеты телефона (10.77.0.0/24, его
+# сеть по кабелю) в свою сеть и подменяет адрес на свой (NAT), как роутер. Новые соединения из домашней сети в кабель —
+# нет: к телефону ходят по его Wi-Fi. Маршрут через Pi телефон ставит сам, когда видит её на кабеле (device/naomi-usb)
+NAT_SYSCTL = "net.ipv4.ip_forward=1"
+NAT_SYSCTL_FILE = "/etc/sysctl.d/71-naomi-dock-nat.conf"
+NAT_RULES = """table ip naomi_dock
+delete table ip naomi_dock
+table ip naomi_dock {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr 10.77.0.0/24 oifname != "usb0" masquerade
+    }
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        oifname "usb0" ct state new drop
+    }
+}"""
+NAT_RULES_FILE = "/etc/naomi-dock/nat.nft"
+# DNS телефону по кабелю: приставка отвечает на «какой адрес у сайта» сама — пересыльщик (dnsmasq) на постоянном адресе
+# 10.77.0.53 со стороны кабеля (свой профиль NetworkManager для usb0: адрес от телефона по DHCP плюс этот). Телефон
+# спрашивает его рядом с роутером по Wi-Fi (device/naomi-usb) — интернет по кабелю работает и с выключенным Wi-Fi
+DNS_ADDR = "10.77.0.53"
+# Адрес — /32, без своей подсети: свои соединения к телефону Pi начинает с адреса от телефона, а не с этого (иначе с
+# выключенным интернетом по кабелю — к 10.77.0.53 у телефона пути нет — ответы на них не доходили бы). Профиль есть —
+# поправить, нет — завести; и включить заново (телефон на кабеле — адреса сейчас; нет — при подключении)
+DNS_PROFILE = (f"{{ nmcli -t -f NAME con show | grep -qx naomi-phone && sudo nmcli con modify naomi-phone ipv4.addresses "
+               f"{DNS_ADDR}/32 || sudo nmcli con add type ethernet ifname usb0 con-name naomi-phone ipv4.method auto "
+               f"ipv4.addresses {DNS_ADDR}/32 ipv4.never-default yes ipv6.method ignore "
+               "connection.autoconnect-priority 10 > /dev/null; sudo nmcli con up naomi-phone > /dev/null 2>&1; true; }")
+DNS_UNIT = f"""[Unit]
+Description=НаомиФон — приставка: DNS телефону по кабелю (docs/PI.md)
+After=network.target
+
+[Service]
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/dev/null --no-hosts --port=53 --listen-address={DNS_ADDR} \\
+    --bind-dynamic --resolv-file=/etc/resolv.conf --cache-size=1000 --pid-file= --log-facility=-
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+"""
+# Свои клавиатуры и трекпады Bluetooth (docs/PI.md, «Трекпад»): после запуска (и перезапуска) Bluetooth — позвать их
+BT_SCRIPT = f"/home/naomi/{SRC}/pi/tools/bt-input.sh"
+BT_UNIT = f"""[Unit]
+Description=НаомиФон — приставка: позвать свои клавиатуры и трекпады Bluetooth (docs/PI.md)
+After=bluetooth.service
+PartOf=bluetooth.service
+
+[Service]
+ExecStart=/bin/sh {BT_SCRIPT} connect
+
+[Install]
+WantedBy=bluetooth.service
+"""
+NAT_UNIT = """[Unit]
+Description=НаомиФон — приставка: интернет телефону по кабелю (docs/PI.md)
+After=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/naomi-dock/nat.nft
+ExecStop=/usr/sbin/nft delete table ip naomi_dock
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def die(msg):
+    print(f"\033[1;31m✗ {msg}\033[0m", file=sys.stderr)
+    sys.exit(1)
+
+
+def ssh(cmd, check=True, tty=False):
+    p = subprocess.run(SSH + (["-t"] if tty else []) + [f"naomi@{HOST}", cmd])
+    if check and p.returncode:
+        die(f"на Pi не вышло: {cmd}")
+    return p.returncode
+
+
+def build():
+    ssh(f"mkdir -p {SRC} {BUILD}")
+    subprocess.run(["rsync", "-a", "--delete", "--relative", "-e", " ".join(SSH),
+                    "pi/", "shell/stream/stream_protocol.h", "shell/stream/key_layout.h", f"naomi@{HOST}:{SRC}/"], cwd=ROOT, check=True)
+    ssh(f"cmake -S {SRC}/pi/dock -B {BUILD} -DCMAKE_BUILD_TYPE=RelWithDebInfo > /dev/null "
+        f"&& cmake --build {BUILD} -j4 2>&1 | grep -vE '^\\[|Consolidate compiler' ; test -x {BIN}")
+    print(f"собрано: ~/{BUILD}/naomi-dock")
+
+
+def phone():
+    """Свой ключ Pi — на телефон (только поток трансляции), ключ хоста телефона — на Pi (docs/PI.md, «Как устроено»)."""
+    naomi = os.path.join(ROOT, "tools", "naomi")
+    def on_phone(cmd, data=None):
+        p = subprocess.run([naomi, "ssh", cmd], input=data, capture_output=True, text=True)
+        if p.returncode:
+            die(f"телефон не ответил (tools/naomi ssh): {p.stderr.strip()[-200:]}")
+        return p.stdout
+    pub = subprocess.run(SSH + [f"naomi@{HOST}", "mkdir -p -m 700 ~/.ssh && { test -f ~/.ssh/naomi_stream || ssh-keygen -q -t ed25519 "
+                         "-N '' -C naomi-dock -f ~/.ssh/naomi_stream; } && cat ~/.ssh/naomi_stream.pub"],
+                         capture_output=True, text=True)
+    if pub.returncode or not pub.stdout.startswith("ssh-"):
+        die("Pi не ответил или ключ не создан")
+    rule = 'restrict,port-forwarding,permitopen="127.0.0.1:8478",command="/bin/false" ' + pub.stdout.strip() + "\n"
+    # прежний ключ приставки (строка с permitopen на порт трансляции) заменяется, остальные строки — как были
+    on_phone("umask 077; mkdir -p ~/.ssh; f=~/.ssh/authorized_keys; touch $f; grep -v 'permitopen=\"127.0.0.1:8478\"' $f > $f.new; "
+             "cat >> $f.new; mv $f.new $f", rule)
+    host = on_phone("cat /etc/ssh/ssh_host_ed25519_key.pub").split()
+    if len(host) < 2 or host[0] != "ssh-ed25519":
+        die("у телефона нет ключа хоста ed25519")
+    ssh(f"umask 077; echo 'naomiphone {host[0]} {host[1]}' > ~/.ssh/known_hosts_phone; "
+        "systemctl is-enabled -q naomi-dock 2>/dev/null && sudo systemctl restart naomi-dock; true")
+    print("Pi и телефон знакомы: ключ Pi на телефоне (только поток трансляции), ключ телефона — на Pi")
+
+
+def main():
+    cmd, args = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("help", [])
+    if cmd == "ssh":
+        sys.exit(ssh(" ".join(args) or "bash -l", check=False, tty=not args))
+    elif cmd == "build":
+        build()
+    elif cmd == "try":
+        sec = int(args[0]) if args else 20
+        env = os.environ.get("PI_ENV", "")
+        # служба — только на это время: стояла включённой — включить снова (раньше оставалась выключенной)
+        ssh(f"sudo systemctl stop naomi-dock 2>/dev/null; sudo env {env} timeout -s INT {sec} {BIN}; "
+            "systemctl is-enabled -q naomi-dock 2>/dev/null && sudo systemctl start naomi-dock; true", check=False)
+    elif cmd == "install":
+        ssh(f"echo '{UNIT}' | sudo tee /etc/systemd/system/naomi-dock.service > /dev/null "
+            "&& echo i2c-dev | sudo tee /etc/modules-load.d/naomi-dock.conf > /dev/null && sudo modprobe i2c-dev "
+            f"&& echo '{NCM_RULE}' | sudo tee {NCM_RULE_FILE} > /dev/null && sudo udevadm control --reload "
+            "&& for f in /sys/class/net/*/cdc_ncm/tx_timer_usecs; do [ -e $f ] && echo 5 | sudo tee $f > /dev/null; done; "
+            f"echo '{NAT_SYSCTL}' | sudo tee {NAT_SYSCTL_FILE} > /dev/null && sudo /usr/sbin/sysctl -q -p {NAT_SYSCTL_FILE} "
+            f"&& sudo mkdir -p /etc/naomi-dock && echo '{NAT_RULES}' | sudo tee {NAT_RULES_FILE} > /dev/null "
+            f"&& echo '{NAT_UNIT}' | sudo tee /etc/systemd/system/naomi-dock-nat.service > /dev/null "
+            f"&& echo '{DNS_UNIT}' | sudo tee /etc/systemd/system/naomi-dock-dns.service > /dev/null && {DNS_PROFILE} "
+            f"&& echo '{BT_UNIT}' | sudo tee /etc/systemd/system/naomi-dock-bt.service > /dev/null "
+            "&& sudo systemctl daemon-reload && sudo systemctl enable naomi-dock-nat naomi-dock-dns naomi-dock-bt -q "
+            "&& sudo systemctl restart naomi-dock-nat naomi-dock-dns "
+            "&& sudo systemctl enable --now naomi-dock && systemctl is-active naomi-dock naomi-dock-nat naomi-dock-dns")
+    elif cmd == "desk":
+        if not args:
+            ssh("cat /etc/naomi-dock.env 2>/dev/null || echo 'по настройкам стола (/var/lib/naomi-dock/screen.json)'",
+                check=False)
+        elif args[0] == "-":
+            ssh("sudo rm -f /etc/naomi-dock.env && sudo systemctl restart naomi-dock")
+        else:
+            w, h, scale = args[0].replace("@", "x").split("x")
+            int(w), int(h), float(scale)   # проверка
+            ssh(f"echo NAOMI_DOCK_DESK={args[0]} | sudo tee /etc/naomi-dock.env > /dev/null "
+                "&& sudo systemctl restart naomi-dock")
+    elif cmd == "fonts":
+        import hashlib
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("naomi_tool", os.path.join(ROOT, "tools", "naomi"))
+        spec = importlib.util.spec_from_loader("naomi_tool", loader)
+        naomi = importlib.util.module_from_spec(spec)
+        loader.exec_module(naomi)
+        src = os.path.join(ROOT, "downloads", "fonts")
+        files = [(n, sha) for n, _, sha in naomi.FONTS if "GoogleSans" in n]
+        for name, sha in files:
+            with open(os.path.join(src, name), "rb") as f:
+                if hashlib.sha256(f.read()).hexdigest() != sha:
+                    die(f"не та сумма SHA-256: {name} (tools/naomi fonts)")
+        ssh("mkdir -p /tmp/naomi-fonts")
+        subprocess.run(["rsync", "-a", "-e", " ".join(SSH)] + [os.path.join(src, n) for n, _ in files]
+                       + [f"naomi@{HOST}:/tmp/naomi-fonts/"], check=True)
+        ssh("sudo mkdir -p /usr/local/share/fonts/naomi && sudo cp /tmp/naomi-fonts/* /usr/local/share/fonts/naomi/ "
+            "&& rm -rf /tmp/naomi-fonts && sudo fc-cache -f >/dev/null && fc-list : family | grep 'Google Sans' | sort -u")
+    elif cmd == "uninstall":
+        ssh("sudo systemctl disable --now naomi-dock naomi-dock-nat naomi-dock-dns naomi-dock-bt; "
+            "sudo nmcli con delete naomi-phone; "
+            "sudo rm -f /etc/systemd/system/naomi-dock.service /etc/systemd/system/naomi-dock-dns.service "
+            "/etc/systemd/system/naomi-dock-bt.service "
+            f"/etc/systemd/system/naomi-dock-nat.service {NAT_RULES_FILE} {NAT_SYSCTL_FILE} "
+            f"/etc/modules-load.d/naomi-dock.conf {NCM_RULE_FILE}; sudo udevadm control --reload; "
+            "sudo systemctl daemon-reload", check=False)
+    elif cmd == "run":
+        ssh("sudo systemctl restart naomi-dock")
+        if args:
+            ssh(f"timeout {int(args[0])} journalctl -u naomi-dock -f -o cat; true", check=False)
+    elif cmd == "stop":
+        ssh("sudo systemctl stop naomi-dock")
+    elif cmd == "phone":
+        phone()
+    elif cmd == "pair":
+        sys.exit(ssh(f"sudo sh {BT_SCRIPT} pair {args[0] if args else ''}", check=False))
+    elif cmd == "log":
+        ssh(f"journalctl -u naomi-dock -o cat --no-pager -n {int(args[0]) if args else 60}", check=False)
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,24 @@
+#cloud-config
+# НаомиФон — первый запуск Raspberry Pi 5, приёмника рабочего стола (docs/PI.md).
+# Кладёт на загрузочный раздел карты tools/pi-card, подставив в ssh_authorized_keys открытый ключ разработчика
+# (private/ssh), в timezone — часовой пояс компьютера, с которого готовят карту. Сделано по образцу Raspberry Pi Imager (src/customization_generator.cpp): SSH в Raspberry Pi OS
+# выключен, cc_ssh его не включает — поэтому runcmd; sudo без пароля — тоже runcmd, как у Imager
+# (ключ `sudo:` обрабатывается не везде). Пароля нет: вход только ключом.
+
+hostname: naomi-pi
+manage_etc_hosts: true
+timezone: "@TIMEZONE@"
+
+user:
+  name: "naomi"
+  shell: /bin/bash
+  lock_passwd: true
+  ssh_authorized_keys:
+    - "@SSH_KEY@"
+  sudo: ALL=(ALL) NOPASSWD:ALL
+
+ssh_pwauth: false
+
+runcmd:
+  - [ systemctl, enable, --now, ssh ]
+  - [ sh, -c, "echo 'naomi ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/010_naomi-nopasswd && chmod 0440 /etc/sudoers.d/010_naomi-nopasswd" ]

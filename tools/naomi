@@ -1,0 +1,1246 @@
+#!/usr/bin/env python3
+"""НаомиФон — команды с Mac для работы с телефоном.
+
+  tools/naomi probe [раздел …]   опись телефона → reports/probe-*.json и краткая сводка
+  tools/naomi test [тест …]      живые тесты железа (device/hwtest.py) → reports/hwtest-*.json,
+                                 снимки камер → reports/camera/
+  tools/naomi stress [нагр] [ост]  нагрев: все ядра CPU на нагр с (60), остывание ост с (30)
+                                 → reports/stress-*.json
+  tools/naomi gamesoak [сек] [пакет] [имя]  долгий замер приложения Android на столе (device/gamesoak.py, 600 с):
+                                 кадры приложения и стола, мощность, нагрев, ограничители, частоты, кто сколько ест
+                                 → reports/gamesoak-имя-*.csv и .json
+  tools/naomi build              отправить shell/ на телефон (~/naomi/src) и собрать в среде сборки
+                                 (device/devroot.sh) → ~/naomi/build
+  tools/naomi install [uninstall]  поставить службы оболочки в систему: автозапуск, безопасный
+                                 режим, кнопка питания (device/install-shell.sh)
+  tools/naomi setup              всё после прошивки и доступа одной командой (docs/INSTALL.md): кабель, среда
+                                 сборки, сборка, службы, выключить Lomiri, шрифты, словари, фильтры, запуск
+  tools/naomi devroot            среда сборки на телефоне (device/devroot.sh): копия корня (≈ 3,3 ГБ на телефоне)
+                                 и пакеты сборки (≈ 175 МБ скачивания); уже есть — не трогает
+  tools/naomi lomiri [off|on]    штатная оболочка Lomiri: выключить / вернуть (device/lomiri.sh); без слова — состояние
+  tools/naomi run [сек]          перезапустить оболочку (служба naomi-shell); с числом — показать
+                                 журнал столько секунд; NAOMI_RUN_ENV="K=V …" — добавить
+                                 окружение (например NAOMI_TRACE=1)
+  tools/naomi stop               остановить оболочку
+  tools/naomi shot [desk] [имя]  снимок экрана оболочки (desk — последний кадр рабочего стола) → reports/screens/
+  tools/naomi mouse ДЕЙСТВИЯ     проверочная мышь стола — как от зрителя, без приставки (docs/STREAM.md, «Проверочная
+                                 мышь»; стол должен смотреть зритель): abs X Y (доли стола), press / release, shift /
+                                 noshift, drag X Y СЕК (протащить отсюда), wait СЕК
+  tools/naomi screens [ЭКРАН off|on|main | desk on|off | wake ЭКРАН | light ЭКРАН auto|ПРОЦЕНТ]
+                                 «Экраны» (docs/SCREENS.md): что на связи и что показывает; положение экрана
+                                 (заставка, стол, главный), выключатель стола, жест пробуждения на экране, яркость
+                                 экрана планшета — как из «Настроек» и окна стола, без пальца
+  tools/naomi panel [сек]        как дисплей кладёт кадр на панель (журнал драйвера): смеситель, слои —
+                                 из кадра → на экран; ждёт кадра до сек (70: в AOD кадр раз в минуту)
+  tools/naomi touchtest          проверка плавности касаний: виртуальный палец + счётчики кадров
+  tools/naomi ssh [команда]      SSH на телефон, ключ — private/ssh
+  tools/naomi shell [команда]    оболочка на телефоне через ADB (без SSH)
+  tools/naomi access             первичная настройка доступа: ключ компьютера (нет — создаёт в private/ssh)
+                                 на телефон и скрипт device/dev-access.sh в /tmp (его запускают один раз через sudo)
+  tools/naomi usb [install|uninstall]  кабель разработчика: ADB и сеть по USB всегда, на кабеле приставка — интернет
+                                 через неё (device/naomi-usb, docs/PI.md); без слова — что сейчас на кабеле
+  tools/naomi phone              служба железа naomid: все объекты и их значения (docs/NAOMID.md)
+  tools/naomi blackbox [часов]   «чёрный ящик» (docs/XRAY.md): что было с телефоном за последние часы (24) по записи
+                                 раз в минуту — перезагрузки и перезапуски служб, рост памяти, потоков и открытых
+                                 файлов оболочки и браузера, тепло и ограничители, мощность → reports/blackbox-*.jsonl
+  tools/naomi fonts              шрифты и значки интерфейса (docs/UI.md) → телефон (~/.local/share/fonts/naomi):
+                                 чего нет в downloads/fonts — скачивает с GitHub (≈ 20 МБ), сверяет SHA-256
+  tools/naomi android [init|tune|status]  Android-приложения (Waydroid, docs/ANDROID.md; device/android-setup.sh):
+                                 init — образы с Google Play (~1,37 ГБ с SourceForge; уже есть — не качает) и
+                                 свойства, tune — настройки внутри Android (нужен включённый Android), status
+  tools/naomi cores [status]     ядра эмуляторов «Игр» стола (docs/GAMES.md; device/cores.sh): скачать исходники
+                                 закреплённой версии с GitHub на телефон (Mesen — ~40 МБ) и собрать в среде сборки
+                                 → ~/naomi/cores; уже скачано — не качает
+  tools/naomi wine [status]      программы Windows на столе (docs/WINDOWS.md; device/wine.sh): скрипты → ~/naomi/bin,
+                                 скачать Wine, DXVK и исходники Box64 и Mesa (≈ 250 МБ), собрать Box64 и драйвер
+                                 Vulkan Turnip в среде сборки (десятки минут); status — что уже есть
+  tools/naomi claude [install|status]  Claude Desktop для Linux на столе (docs/CLAUDE.md; device/claude.sh):
+                                 новейший пакет arm64 из репозитория Anthropic (≈ 185 МБ, подпись и SHA-256
+                                 сверяются) → ~/naomi/opt/claude-desktop; status — что стоит и что новейшее
+  tools/naomi dict               словари клавиатуры (docs/KEYBOARD.md): частоты слов (нет в downloads/dict —
+                                 скачивает с GitHub, ≈ 30 МБ, сверяет SHA-256) → дерево слов → телефон
+                                 (~/.local/share/naomi/dict)
+  tools/naomi web-filters        блокировка рекламы и слежки в «Браузере» (docs/WEB.md): EasyList и EasyPrivacy
+                                 (нет в downloads/filters — скачивает с easylist.to, ≈ 5 МБ) → доменные правила →
+                                 телефон (~/.local/share/naomi/web/filters.txt)
+  tools/naomi desktop-wallpaper файл [имя]  обои рабочего стола (docs/DESKTOP.md) → телефон: в собрание
+                                 «Настроек» → «Обои» (~/.config/naomi/desktop/wallpapers/имя) и на стол
+                                 (wallpaper.jpg)
+
+Связь (первое, что отвечает): сеть по кабелю — SSH на 10.77.0.1 (служба naomi-usb); ADB — SSH через
+`adb forward` на порт 22 телефона; Wi-Fi — на адрес из private/device.json (его запоминает каждая связь
+по кабелю) или из NAOMI_HOST; Wi-Fi молчит — через приставку, у которой телефон на кабеле (SSH на
+NAOMI_PI_HOST или naomi-pi.local, оттуда на 10.77.0.1). NAOMI_VIA=cable|adb|wifi|pi — только этот путь. Ключ хоста один и тот же,
+закреплён в private/ssh/known_hosts.
+Разделы описи — device/probe.py (SECTIONS).
+"""
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPORTS = os.path.join(ROOT, "reports")
+SSH_DIR = os.path.join(ROOT, "private", "ssh")
+SSH_KEY = os.path.join(SSH_DIR, "naomiphone_ed25519")
+SSH_PORT = 40022  # порт Mac, проброшенный через ADB на порт 22 телефона
+CABLE_HOST = "10.77.0.1"  # телефон в сети по кабелю (device/naomi-usb)
+DEVICE_JSON = os.path.join(ROOT, "private", "device.json")
+
+
+def die(msg):
+    print(f"\033[1;31m✗ {msg}\033[0m", file=sys.stderr)
+    sys.exit(1)
+
+
+def fetch(url, path, sha=None):
+    """Файл, которого нет, — скачать (curl): пишет, что и откуда; sha — сверить SHA-256 (не та — файл убрать)."""
+    import hashlib
+    if not os.path.isfile(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        print(f"скачиваю {os.path.basename(path)} ← {url}", flush=True)
+        if subprocess.run(["curl", "-sSfL", "--retry", "2", "-o", path + ".part", url]).returncode:
+            if os.path.exists(path + ".part"):
+                os.remove(path + ".part")
+            die(f"не скачалось: {url}")
+        os.replace(path + ".part", path)
+    if sha:
+        with open(path, "rb") as f:
+            got = hashlib.sha256(f.read()).hexdigest()
+        if got != sha:
+            die(f"не та сумма SHA-256: {path} (ждали {sha}, вышло {got}) — удалите файл и повторите")
+
+
+def adb(*args, capture=True, check=True):
+    p = subprocess.run(["adb", *args], capture_output=capture, text=True)
+    if check and p.returncode != 0:
+        die(f"adb {' '.join(args)}: {(p.stderr or p.stdout).strip()}")
+    return p.stdout if capture else p.returncode
+
+
+def adb_device():
+    """Серийный номер единственного телефона в ADB или None. Другие устройства Android (планшет — docs/TABLET.md)
+    — мимо: телефон называет себя device:redfin (getprop ro.product.device и под Ubuntu Touch)."""
+    out = adb("devices", "-l", check=False) or ""
+    devs = []
+    for l in out.splitlines()[1:]:
+        f = l.split()
+        if len(f) < 2 or f[1] != "device":
+            continue
+        name = next((x.split(":", 1)[1] for x in f[2:] if x.startswith("device:")), None)
+        if name in (None, "redfin"):
+            devs.append(f[0])
+    if len(devs) > 1:
+        die(f"в ADB несколько устройств: {devs}")
+    return devs[0] if devs else None
+
+
+def need_device():
+    dev = adb_device()
+    if not dev:
+        die("телефон не виден в ADB: режим USB без ADB или кабель не подключён "
+            "(tools/flash.sh status — что с ним)")
+    return dev
+
+
+def device_info():
+    try:
+        with open(DEVICE_JSON) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+_route = None
+
+
+def cable_up():
+    """Отвечает ли SSH телефона в сети по кабелю."""
+    try:
+        socket.create_connection((CABLE_HOST, 22), timeout=0.7).close()
+        return True
+    except OSError:
+        return False
+
+
+def answers(host):
+    """Отвечает ли SSH по этому адресу."""
+    try:
+        socket.create_connection((host, 22), timeout=2).close()
+        return True
+    except OSError:
+        return False
+
+
+PI_HOST = os.environ.get("NAOMI_PI_HOST", "naomi-pi.local")   # приставка: телефон у неё на кабеле — 10.77.0.1
+
+
+def route():
+    """Как дойти до SSH телефона: ('cable', host, 22), ('adb', 127.0.0.1, порт) или ('wifi', host, 22)."""
+    global _route
+    if _route:
+        return _route
+    via = os.environ.get("NAOMI_VIA")
+    if via in (None, "cable") and cable_up():
+        _route = ("cable", CABLE_HOST, 22)
+    elif via in (None, "adb") and adb_device():
+        adb("forward", f"tcp:{SSH_PORT}", "tcp:22")
+        _route = ("adb", "127.0.0.1", SSH_PORT)
+    elif via in (None, "wifi", "pi"):
+        host = os.environ.get("NAOMI_HOST") or device_info().get("wifi_ip")
+        # Wi-Fi телефона молчит (он не в домашней сети), а телефон — на кабеле у приставки: через неё (docs/PI.md)
+        if via == "pi" or (via is None and not (host and answers(host))):
+            _route = ("pi", CABLE_HOST, 22)
+        elif not host:
+            die("по кабелю телефона не видно, а адрес Wi-Fi неизвестен")
+        else:
+            _route = ("wifi", host, 22)
+    else:
+        die(f"NAOMI_VIA={via}: этим путём телефона не видно")
+    return _route
+
+
+def ssh_argv(*remote, tty=False):
+    """Команда ssh на телефон: по кабелю через ADB-туннель, иначе по Wi-Fi."""
+    via, host, port = route()
+    first = not os.path.exists(os.path.join(SSH_DIR, "known_hosts"))
+    jump = []
+    if via == "pi":   # через приставку: её SSH пробрасывает соединение на телефон по кабелю
+        jump = ["-o", f"ProxyCommand=ssh -i {shlex.quote(SSH_KEY)} -o IdentitiesOnly=yes -o BatchMode=yes "
+                      f"-o ConnectTimeout=8 -o UserKnownHostsFile={shlex.quote(os.path.join(SSH_DIR, 'known_hosts_pi'))} "
+                      f"naomi@{PI_HOST} -W {CABLE_HOST}:22"]
+    return ["ssh", "-i", SSH_KEY, "-p", str(port), *jump,
+            "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            # оборванную связь (кабель переподключился) замечать за ~6 с, а не висеть
+            "-o", "ServerAliveInterval=2", "-o", "ServerAliveCountMax=3",
+            "-o", f"UserKnownHostsFile={os.path.join(SSH_DIR, 'known_hosts')}",
+            "-o", "HostKeyAlias=naomiphone",
+            "-o", "StrictHostKeyChecking=" + ("accept-new" if first else "yes"),
+            *(["-t"] if tty else []), f"phablet@{host}", *remote]
+
+
+def ssh_ok():
+    p = subprocess.run(ssh_argv("true"), capture_output=True, text=True)
+    if p.returncode == 0 and route()[0] != "wifi":
+        remember_wifi()
+    return p.returncode == 0
+
+
+def remember_wifi():
+    """Запомнить адрес Wi-Fi телефона — для связи, когда кабеля нет."""
+    p = subprocess.run(ssh_argv("ip -4 -o addr show wlan0"), capture_output=True, text=True)
+    parts = p.stdout.split()
+    ip = parts[parts.index("inet") + 1].split("/")[0] if "inet" in parts else None
+    info = device_info()
+    if ip and info.get("wifi_ip") != ip:
+        info["wifi_ip"] = ip
+        os.makedirs(os.path.dirname(DEVICE_JSON), exist_ok=True)
+        with open(DEVICE_JSON, "w") as f:
+            json.dump(info, f, indent=1)
+
+
+def push(local, remote):
+    """Скопировать файл на телефон: по SSH (кабель или Wi-Fi), если он есть, иначе через ADB."""
+    if ssh_ok():
+        with open(local, "rb") as f:
+            p = subprocess.run(ssh_argv(f"cat > {remote}"), stdin=f, capture_output=True)
+        if p.returncode != 0:
+            die(f"не скопировать {local}: {p.stderr.decode().strip()}")
+        return True
+    need_device()
+    adb("push", local, remote)
+    return False
+
+
+def summary(r):
+    def g(*path, default="—"):
+        cur = r
+        for p in path:
+            if not isinstance(cur, dict) or p not in cur:
+                return default
+            cur = cur[p]
+        return cur
+
+    out = []
+    s = r.get("system", {})
+    if s:
+        mem = s.get("meminfo_kb", {})
+        out.append(f"система   {s.get('os')} · {(s.get('uname') or '').split()[2:3]} · "
+                   f"RAM {mem.get('MemAvailable', 0)//1024}/{mem.get('MemTotal', 0)//1024} МиБ свободно")
+    for p in g("cpu", "policies", default=[]):
+        out.append(f"CPU {p['cpus']:<8} {p['governor']:<11} {p['cur_khz']//1000 if isinstance(p['cur_khz'], int) else '?'} МГц"
+                   f" (до {p['hw_max_khz']//1000 if isinstance(p['hw_max_khz'], int) else '?'})")
+    if "gpu" in r:
+        out.append(f"GPU       {g('gpu', 'gpu_model')} · {g('gpu', 'gpuclk')} Гц · "
+                   f"частоты {g('gpu', 'gpu_available_frequencies')}")
+    zones = g("thermal", "zones", default=[])
+    if zones:
+        # настоящие температуры в миллиградусах; «soc», «*-lvl*» и −273° — не температуры
+        real = {z["type"]: z["temp"] / 1000 for z in zones
+                if isinstance(z["temp"], int) and 0 < z["temp"] < 150000 and z["type"] != "soc"
+                and "-lvl" not in z["type"]}
+        key = [k for k in ("skin-therm", "cpu-1-max-step", "gpuss-max-step", "battery", "disp-therm")
+               if k in real]
+        hottest = max(real, key=real.get) if real else None
+        out.append("тепло     " + ", ".join(f"{k} {real[k]:.1f}°" for k in key)
+                   + (f" · горячее всех {hottest} {real[hottest]:.1f}°" if hottest else "")
+                   + f" (зон {len(zones)})")
+    bat = g("power", "supplies", "battery", default={})
+    if bat:
+        out.append(f"батарея   {bat.get('capacity')}% {bat.get('status')} · "
+                   f"{int(bat.get('current_now', 0))/1000:.0f} мА · {int(bat.get('voltage_now', 0))/1e6:.2f} В · "
+                   f"{int(bat.get('temp', 0))/10:.1f}°")
+    for c in g("display", "drm", default=[]):
+        if c.get("modes") and "Virtual" not in c["connector"]:
+            out.append(f"дисплей   {c['connector']} {c['status']} · режимы {', '.join(c['modes'])}")
+    svc = r.get("services", {})
+    if svc:
+        out.append(f"службы    работают {len(svc.get('running', []))}, упали: {svc.get('failed') or 'нет'}; "
+                   f"пользователя: {len(svc.get('user_running', []))}, упали: {svc.get('user_failed') or 'нет'}")
+    a = r.get("android", {})
+    if a:
+        out.append(f"Android   служб работает {len(a.get('services_running', []))}")
+    for key in ("modem", "bluetooth", "audio", "sensors"):
+        if key in r:
+            v = r[key]
+            if key == "modem":
+                out.append(f"модем     {v.get('modems') or v.get('error')}")
+            elif key == "bluetooth":
+                out.append(f"bluetooth {v.get('hci')}")
+            elif key == "audio":
+                out.append(f"звук      выходов {len(v.get('sinks', []))}, входов {len(v.get('sources', []))}")
+            elif key == "sensors":
+                out.append(f"датчики   sensorfw: {v.get('sensorfw_plugins') or v.get('sensorfw_raw')}")
+    errs = [k for k, v in r.items() if isinstance(v, dict) and "error" in v]
+    if errs:
+        out.append(f"ошибки в разделах: {errs}")
+    return "\n".join(out)
+
+
+def cmd_probe(sections):
+    via_ssh = push(os.path.join(ROOT, "device", "probe.py"), "/tmp/naomi-probe.py")
+    t = time.time()
+    if via_ssh:
+        p = subprocess.run(ssh_argv("python3", "/tmp/naomi-probe.py", *sections),
+                           capture_output=True, text=True)
+        out = p.stdout
+    else:
+        out = adb("shell", "python3", "/tmp/naomi-probe.py", *sections)
+    try:
+        report = json.loads(out)
+    except json.JSONDecodeError:
+        die("опись вернула не JSON:\n" + out[-2000:])
+    os.makedirs(REPORTS, exist_ok=True)
+    path = os.path.join(REPORTS, time.strftime("probe-%Y%m%d-%H%M%S.json"))
+    with open(path, "w") as f:
+        json.dump(report, f, ensure_ascii=False, indent=1)
+    print(summary(report))
+    print(f"\nполная опись: {os.path.relpath(path, ROOT)} ({time.time() - t:.1f} с)")
+
+
+STATUS_MARK = {"ok": "\033[32m✓ работает\033[0m", "partial": "\033[33m◐ частично\033[0m",
+               "fail": "\033[31m✗ не работает\033[0m", "manual": "\033[36m? проверь сам\033[0m",
+               "skip": "\033[90m— пропущен\033[0m"}
+
+
+def cmd_test(names):
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    subprocess.run(ssh_argv("mkdir -p /tmp/naomi-qml"), check=True)
+    push(os.path.join(ROOT, "device", "hwtest.py"), "/tmp/naomi-hwtest.py")
+    qml_dir = os.path.join(ROOT, "device", "qml")
+    for f in sorted(os.listdir(qml_dir)):
+        push(os.path.join(qml_dir, f), f"/tmp/naomi-qml/{f}")
+    p = subprocess.run(ssh_argv("python3", "/tmp/naomi-hwtest.py", *names),
+                       stdout=subprocess.PIPE, text=True)  # ход теста (stderr) — сразу на экран
+    try:
+        report = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        die("тест вернул не JSON:\n" + p.stdout[-2000:])
+    os.makedirs(REPORTS, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(REPORTS, f"hwtest-{stamp}.json")
+    with open(path, "w") as f:
+        json.dump(report, f, ensure_ascii=False, indent=1)
+    cam = report["results"].get("camera", {}).get("details", {}).get("shots", {})
+    if cam:
+        os.makedirs(os.path.join(REPORTS, "camera"), exist_ok=True)
+    for idx, shot in cam.items():
+        local = os.path.join(REPORTS, "camera", f"{stamp}-cam{idx}.jpg")
+        with open(local, "wb") as f:
+            subprocess.run(ssh_argv(f"cat {shot['file']}"), stdout=f, check=True)
+    print()
+    for name, r in report["results"].items():
+        print(f"{name:<10} {STATUS_MARK.get(r['status'], r['status'])}  {r['summary']}")
+    print(f"\nотчёт: {os.path.relpath(path, ROOT)}")
+
+
+def cmd_stress(args):
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    push(os.path.join(ROOT, "device", "stress.py"), "/tmp/naomi-stress.py")
+    p = subprocess.run(ssh_argv("python3", "/tmp/naomi-stress.py", *args), stdout=subprocess.PIPE, text=True)
+    try:
+        report = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        die("тест нагрева вернул не JSON:\n" + p.stdout[-2000:])
+    os.makedirs(REPORTS, exist_ok=True)
+    path = os.path.join(REPORTS, time.strftime("stress-%Y%m%d-%H%M%S.json"))
+    with open(path, "w") as f:
+        json.dump(report, f, ensure_ascii=False, indent=1)
+    s = report["summary"]
+    print(f"\nнагрузка {s['load_s']} с, остывание {s['cool_s']} с, батарея: {s['charging']}")
+    for k in s["peak"]:
+        print(f"  {k:<15} было {s['start'].get(k)}° → максимум {s['peak'][k]}° → в конце {s['end'].get(k)}°")
+    print(f"  частоты под нагрузкой (мин / паспорт, МГц): "
+          + ", ".join(f"{k} {s['cpu_mhz_min_under_load'].get(k)}/{v}" for k, v in s["cpu_mhz_hw_max"].items()))
+    print(f"  троттлинг: {s['throttled'] or 'нет'}; ограничители: {s['cooling_seen'] or 'не включались'}")
+    print(f"отчёт: {os.path.relpath(path, ROOT)}")
+
+
+def cmd_gamesoak(args):
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    dur = args[0] if args else "600"
+    pkg = args[1] if len(args) > 1 else "-"
+    name = args[2] if len(args) > 2 else "run"
+    push(os.path.join(ROOT, "device", "gamesoak.py"), "/tmp/naomi-gamesoak.py")
+    p = subprocess.run(ssh_argv("sudo", "-n", "python3", "/tmp/naomi-gamesoak.py", dur, pkg, "/tmp/naomi-gamesoak.csv"),
+                       stdout=subprocess.PIPE, text=True)
+    try:
+        report = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        die("замер вернул не JSON:\n" + p.stdout[-2000:])
+    os.makedirs(REPORTS, exist_ok=True)
+    base = os.path.join(REPORTS, time.strftime(f"gamesoak-{name}-%Y%m%d-%H%M%S"))
+    with open(base + ".csv", "w") as f:
+        f.write(subprocess.run(ssh_argv("cat /tmp/naomi-gamesoak.csv"), capture_output=True, text=True).stdout)
+    report["csv"] = os.path.relpath(base + ".csv", ROOT)
+    with open(base + ".json", "w") as f:
+        json.dump(report, f, ensure_ascii=False, indent=1)
+    h = report["second_half"]
+    print(f"\nвторая половина: {h['W']} Вт, кадров {h['fps']} (долгих {h['long']}), стол {h['desk_fps']}, "
+          f"корпус {h['skin-therm']}°, плата {h['sdm-therm']}°, ядра {h['f0']}/{h['f6']}/{h['f7']} МГц, "
+          f"видеочип {h['gpuMHz']} МГц {h['gpu%']}%")
+    print(f"отчёт: {os.path.relpath(base, ROOT)}.json и .csv")
+
+
+PHONE = "/home/phablet/naomi"        # исходники, сборка и скрипты на телефоне
+DEVROOT = f"{PHONE}/bin/devroot.sh"   # окружение оболочки — в службе (device/install-shell.sh)
+
+
+def ssh_run(script, check=True, capture=False):
+    p = subprocess.run(ssh_argv(script), text=True, capture_output=capture)
+    if check and p.returncode != 0:
+        die(f"на телефоне не вышло (код {p.returncode}): {script[:120]}")
+    return p
+
+
+def cmd_build():
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    ssh_run(f"mkdir -p {PHONE}/bin {PHONE}/src")
+    push(os.path.join(ROOT, "device", "devroot.sh"), DEVROOT)
+    tar = subprocess.Popen(["tar", "--no-xattrs", "-C", ROOT, "-czf", "-", "shell"],
+                           stdout=subprocess.PIPE, env={**os.environ, "COPYFILE_DISABLE": "1"})
+    subprocess.run(ssh_argv(f"rm -rf {PHONE}/src/shell && tar -C {PHONE}/src -xzf -"),
+                   stdin=tar.stdout, check=True)
+    tar.wait()
+    t = time.time()
+    ssh_run(f"sudo -n sh {DEVROOT} user 'cmake -S {PHONE}/src/shell -B {PHONE}/build -G Ninja "
+            f"-DCMAKE_BUILD_TYPE=RelWithDebInfo -Wno-dev >/dev/null && ninja -C {PHONE}/build'")
+    print(f"собрано за {time.time() - t:.0f} с: {PHONE}/build")
+
+
+def cmd_install(args):
+    """Поставить службы оболочки в систему (device/install-shell.sh) или убрать (uninstall)."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    ssh_run(f"mkdir -p {PHONE}/bin")
+    for f in ("install-shell.sh", "shell-prepare", "safescreen.py", "hwcspike.py", "blackbox.py"):
+        push(os.path.join(ROOT, "device", f), f"{PHONE}/bin/{f}")
+    action = "uninstall" if args[:1] == ["uninstall"] else "install"
+    ssh_run(f"sudo -n sh {PHONE}/bin/install-shell.sh {action}")
+    if action == "install":
+        # главный экран: часы, заряд и список программ — слои проекта (docs/SHELL.md, «Проект студии»); своего
+        # проекта на телефоне нет — кладём проект по умолчанию (device/default-project.json), свой не трогаем
+        conf = "/home/phablet/.config/naomi"
+        if ssh_run(f"test -e {conf}/project.json", check=False).returncode:
+            ssh_run(f"mkdir -p {conf}")
+            push(os.path.join(ROOT, "device", "default-project.json"), f"{conf}/project.json")
+            print("главный экран: проект по умолчанию (часы, заряд, «Настройки»)")
+
+
+def cmd_devroot():
+    """Среда сборки на телефоне: копия корня и пакеты (device/devroot.sh). Есть — create ничего не делает."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    ssh_run(f"mkdir -p {PHONE}/bin")
+    push(os.path.join(ROOT, "device", "devroot.sh"), DEVROOT)
+    ssh_run(f"sudo -n sh {DEVROOT} create")
+    # пакеты: вывод apt длинный — на экран только конец, но код выхода — его, а не tail
+    ssh_run(f"sudo -n sh {DEVROOT} packages > /tmp/naomi-devroot-packages.log 2>&1; code=$?; "
+            "tail -3 /tmp/naomi-devroot-packages.log; exit $code")
+
+
+def cmd_lomiri(args):
+    """Штатная оболочка Lomiri: off — выключить, on — вернуть (device/lomiri.sh); иначе — состояние."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    ssh_run(f"mkdir -p {PHONE}/bin")
+    push(os.path.join(ROOT, "device", "lomiri.sh"), f"{PHONE}/bin/lomiri.sh")
+    action = args[0] if args[:1] in (["off"], ["on"]) else "status"
+    ssh_run(("sudo -n " if action != "status" else "") + f"sh {PHONE}/bin/lomiri.sh {action}")
+
+
+def cmd_setup():
+    """Всё после прошивки и `tools/naomi access` (docs/INSTALL.md), по порядку; повторный запуск безопасен."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    # пакеты сборки apt берёт из интернета; без Wi-Fi у телефона нет и верных часов (apt не верит подписям «из будущего»)
+    if ssh_run("ping -c1 -W4 ports.ubuntu.com >/dev/null 2>&1 || ping -c1 -W4 repo.ubports.com >/dev/null 2>&1",
+               check=False).returncode:
+        die("у телефона нет интернета: подключите его к Wi-Fi («Настройки системы» → Wi-Fi) и запустите снова")
+    ssh_run(f"now={int(time.time())}; d=$(( $(date +%s) - now )); [ ${{d#-}} -lt 120 ] || "
+            f"{{ sudo -n date -u -s @{int(time.time())} >/dev/null && echo 'часы телефона поставлены по компьютеру'; }}")
+    steps = [("кабель: ADB и сеть по USB", lambda: cmd_usb(["install"])),
+             ("среда сборки на телефоне (≈ 10 минут)", cmd_devroot),
+             ("сборка оболочки", cmd_build),
+             ("службы оболочки", lambda: cmd_install([])),
+             ("шрифты", cmd_fonts),
+             ("словари клавиатуры", cmd_dict),
+             ("фильтры рекламы браузера", cmd_web_filters),
+             ("Lomiri — выключить", lambda: cmd_lomiri(["off"])),
+             ("запуск оболочки", lambda: cmd_run([]))]
+    for n, (name, step) in enumerate(steps, 1):
+        print(f"\n—— {n}/{len(steps)}: {name}", flush=True)
+        step()
+    print("\nготово: на телефоне — оболочка НаомиФона. Дальше — приставка, экраны, игры: docs/INSTALL.md")
+
+
+def cmd_usb(args):
+    """Кабель разработчика (device/naomi-usb): поставить, убрать или показать состояние."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    global _route
+    if args[:1] in (["install"], ["uninstall"]):
+        ssh_run(f"mkdir -p {PHONE}/bin")
+        push(os.path.join(ROOT, "device", "naomi-usb"), f"{PHONE}/bin/naomi-usb")
+        # установка переподключает USB и рвёт связь по кабелю — пусть идёт на телефоне сама по себе,
+        # через секунду, когда SSH уже закрылся
+        since = ssh_run(f"date +%s; sudo -n systemd-run --quiet --collect --unit=naomi-usb-setup "
+                        f"--on-active=1 --timer-property=AccuracySec=100ms sh {PHONE}/bin/naomi-usb {args[0]}",
+                        capture=True).stdout.split()[0]
+        time.sleep(3)
+        for _ in range(30):
+            _route = None
+            if ssh_ok():
+                break
+            time.sleep(1)
+        else:
+            die("телефон не ответил после установки (tools/naomi usb — проверить)")
+        ssh_run(f"journalctl -u naomi-usb-setup --since @{since} -o cat --no-pager "
+                "| grep -vE '^(Started|naomi-usb-setup)'", check=False)
+        print(f"связь: {route()[0]}", flush=True)
+    else:
+        print(f"связь: {route()[0]}", flush=True)
+        ssh_run("test -x /usr/local/sbin/naomi-usb && /usr/local/sbin/naomi-usb status "
+                "|| echo 'naomi-usb не установлен: tools/naomi usb install'", check=False)
+
+
+def cmd_android(args):
+    """Android-приложения: настройка Waydroid на телефоне (device/android-setup.sh)."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    action = args[0] if args else "status"
+    if action not in ("init", "tune", "status"):
+        die("tools/naomi android [init|tune|status]")
+    ssh_run(f"mkdir -p {PHONE}/bin")
+    push(os.path.join(ROOT, "device", "android-setup.sh"), f"{PHONE}/bin/android-setup.sh")
+    ssh_run(f"sudo -n sh {PHONE}/bin/android-setup.sh {action}", check=False)
+
+
+def cmd_cores(args):
+    """Ядра эмуляторов «Игр» (device/cores.sh): скачать и собрать на телефоне или показать, что собрано."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    action = args[0] if args else "build"
+    if action not in ("build", "status"):
+        die("tools/naomi cores [status]")
+    ssh_run(f"mkdir -p {PHONE}/bin")
+    push(os.path.join(ROOT, "device", "devroot.sh"), DEVROOT)
+    push(os.path.join(ROOT, "device", "cores.sh"), f"{PHONE}/bin/cores.sh")
+    ssh_run(f"sh {PHONE}/bin/cores.sh {action}", check=False)
+
+
+def cmd_wine(args):
+    """Программы Windows: скрипты на телефон и device/wine.sh fetch, box64, mesa (или status)."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    ssh_run(f"mkdir -p {PHONE}/bin")
+    for f in ("wine.sh", "winrun", "winkill", "flatout2", "nfsmw"):
+        push(os.path.join(ROOT, "device", f), f"{PHONE}/bin/{f}")
+    ssh_run(f"chmod +x {PHONE}/bin/winrun {PHONE}/bin/winkill {PHONE}/bin/flatout2 {PHONE}/bin/nfsmw")
+    if args[:1] == ["status"]:
+        ssh_run(f"sh {PHONE}/bin/wine.sh status", check=False)
+    else:
+        ssh_run(f"sh {PHONE}/bin/wine.sh fetch && sh {PHONE}/bin/wine.sh box64 && sh {PHONE}/bin/wine.sh mesa")
+
+
+def cmd_claude(args):
+    """Claude Desktop для Linux на столе (device/claude.sh): поставить или обновить, или показать, что стоит."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    action = args[0] if args else "status"
+    if action not in ("install", "status"):
+        die("tools/naomi claude [install|status]")
+    ssh_run(f"mkdir -p {PHONE}/bin")
+    push(os.path.join(ROOT, "device", "claude.sh"), f"{PHONE}/bin/claude.sh")
+    push(os.path.join(ROOT, "device", "naomi-claude"), f"{PHONE}/bin/naomi-claude")
+    push(os.path.join(ROOT, "device", "naomi-xdg-open"), f"{PHONE}/bin/naomi-xdg-open")
+    ssh_run(f"sh {PHONE}/bin/claude.sh {action}", check=False)
+
+
+def cmd_blackbox(args):
+    """Разбор «чёрного ящика» (device/blackbox.py): записи за последние часы и что в них растёт."""
+    hours = float(args[0]) if args else 24
+    since = time.time() - hours * 3600
+    raw = ssh_run("cat /userdata/naomi/blackbox/*.jsonl 2>/dev/null", capture=True, check=False).stdout
+    rows = []
+    for line in raw.splitlines():
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if r.get("t", 0) >= since:
+            rows.append(r)
+    if not rows:
+        die("записей нет: служба naomi-blackbox не стоит? (tools/naomi install)")
+    os.makedirs(REPORTS, exist_ok=True)
+    out = os.path.join(REPORTS, f"blackbox-{time.strftime('%Y%m%d-%H%M%S')}.jsonl")
+    with open(out, "w") as f:
+        f.write("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n")
+
+    def hm(t):
+        return time.strftime("%d.%m %H:%M", time.localtime(t))
+
+    span = (rows[-1]["t"] - rows[0]["t"]) / 3600
+    print(f"чёрный ящик: {hm(rows[0]['t'])} — {hm(rows[-1]['t'])} ({span:.1f} ч), записей {len(rows)} → "
+          f"{os.path.relpath(out, ROOT)}")
+    boots = [r for a, r in zip(rows, rows[1:]) if r["up"] < a["up"]]
+    gaps = [(a, r) for a, r in zip(rows, rows[1:]) if r["t"] - a["t"] > 150 and r["up"] >= a["up"]]
+    print(f"перезагрузок телефона: {len(boots)}" + (": " + ", ".join(hm(r["t"]) for r in boots) if boots else "")
+          + (f"; пропусков записи дольше 2,5 мин: {len(gaps)} (" + ", ".join(hm(a["t"]) for a, _ in gaps[:5]) + ")"
+             if gaps else ""))
+    names = {"shell": "оболочка", "naomid": "naomid", "web": "браузер", "pulse": "PulseAudio", "sshd": "sshd"}
+    for key, title in names.items():
+        seq = [(r["t"], r["p"][key]) for r in rows if key in r.get("p", {})]
+        if not seq:
+            print(f"{title}: не запускался")
+            continue
+        if key == "sshd":   # процессов много, свой pid у каждого входа — перезапуски не считаем
+            restarts, last = [], seq
+            line = f"{title}: процессов до {max(p['n'] for _, p in seq)}"
+        else:
+            restarts = [t for (_, a), (t, b) in zip(seq, seq[1:]) if a["pid"] != b["pid"]]
+            # последний непрерывный отрезок (один и тот же процесс): на нём и смотреть рост
+            last = [(t, p) for t, p in seq if p["pid"] == seq[-1][1]["pid"]]
+            line = f"{title}: перезапусков {len(restarts)}" + (" (" + ", ".join(hm(t) for t in restarts[-4:]) + ")"
+                                                               if restarts else "")
+        dur = (last[-1][0] - last[0][0]) / 3600
+        line += f"; работает {dur:.1f} ч"
+        for field, unit in (("rss", "МБ"), ("thr", "потоков"), ("fd", "файлов"), ("sock", "сокетов"),
+                            ("dmabuf", "dma-buf"), ("audio", "захватов звука")):
+            v = [p[field] for _, p in last if field in p]
+            if not v:
+                continue
+            line += f"; {unit} {v[0]} → {v[-1]}" + (f" (от {min(v)} до {max(v)})"
+                                                    if min(v) != min(v[0], v[-1]) or max(v) != max(v[0], v[-1]) else "")
+            if dur >= 0.5 and len(v) >= 20 and field in ("rss", "thr", "fd", "sock"):
+                # рост — медиана второй половины отрезка против первой
+                h = len(v) // 2
+                a, b = sorted(v[:h])[h // 2], sorted(v[h:])[(len(v) - h) // 2]
+                if b > a * 1.15 + 2:
+                    line += f" — РАСТЁТ: +{(b - a) / (dur / 2):.0f} в час"
+        cpu = [p["cpu"] for _, p in last if "cpu" in p]
+        if cpu:
+            line += f"; процессор в среднем {sum(cpu) / len(cpu):.1f} %"
+        print(line)
+    avail = [r["mem"]["avail"] for r in rows]
+    print(f"память: доступно {avail[-1]} МБ (наименьшее за период {min(avail)}); потоков в системе до "
+          f"{max(r['n']['threads'] for r in rows)}")
+    skin = [r["temp"].get("skin", 0) for r in rows]
+    hot = [r for r in rows if r.get("cool")]
+    print(f"тепло: корпус до {max(skin):.1f} °C, сейчас {skin[-1]:.1f}; минут с ограничителями: {len(hot)}"
+          + (" (наибольшие ступени: " + ", ".join(f"{k} {max(r['cool'].get(k, 0) for r in hot)}"
+                                                 for k in sorted({k for r in hot for k in r["cool"]})) + ")"
+             if hot else ""))
+    for on, title in ((True, "стол смотрят"), (False, "стола нет")):
+        w = [r["power"]["usb_w"] for r in rows if r.get("desk") == on]
+        if w:
+            print(f"мощность от кабеля, {title}: {sum(w) / len(w):.2f} Вт в среднем, до {max(w):.2f} ({len(w)} мин)")
+    if "disk_free_mb" in rows[-1]:
+        print(f"место на /userdata: {rows[-1]['disk_free_mb'] / 1024:.1f} ГБ свободно")
+
+
+def cmd_phone():
+    """Служба железа naomid: объекты со свойствами и методами."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    ssh_run("systemctl is-active -q naomid || { echo 'naomid не работает (tools/naomi install)'; exit 0; }; "
+            "for o in $(busctl --system tree --list org.naomi.Phone | grep '^/org/naomi/Phone/'); do "
+            "echo \"== $o\"; busctl --system introspect org.naomi.Phone $o org.naomi.Phone.${o##*/} "
+            "| tail -n +2 | tr -s ' ' | cut -c1-160; done",
+            check=False)
+
+
+def cmd_run(args):
+    """Перезапустить службу naomi-shell; NAOMI_RUN_ENV — добавочное окружение (~/naomi/shell.env)."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    if ssh_run("test -f /etc/systemd/system/naomi-shell.service", check=False).returncode:
+        die("служба не установлена: tools/naomi install")
+    extra = os.environ.get("NAOMI_RUN_ENV", "").split()
+    env_file = "\\n".join(kv for kv in extra if "=" in kv)
+    ssh_run(f"printf '{env_file}\\n' > {PHONE}/shell.env; sudo -n systemctl reset-failed naomi-shell "
+            "2>/dev/null; sudo -n systemctl restart naomi-shell")
+    print("оболочка запущена: служба naomi-shell (журнал — journalctl -u naomi-shell)"
+          + (f"; окружение: {' '.join(extra)}" if extra else ""))
+    if args:
+        time.sleep(float(args[0]))
+        ssh_run("journalctl -u naomi-shell -b --no-pager -o cat | grep -v '^dlopen failed' | tail -40",
+                check=False)
+
+
+def cmd_shot(args):
+    """Снимок экрана оболочки (SIGUSR2 → /tmp/naomi-shot.png) → reports/screens/; печатает путь. «desk» первым словом —
+    последний кадр рабочего стола (/tmp/naomi-desk.png: то, что ушло зрителю; стол не смотрят — где остановился)."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    desk = args[:1] == ["desk"]
+    if desk:
+        args = args[1:]
+    f = "/tmp/naomi-desk.png" if desk else "/tmp/naomi-shot.png"
+    p = ssh_run("P=$(systemctl show -p MainPID --value naomi-shell); [ \"$P\" != 0 ] || exit 3; "
+                f"rm -f /tmp/naomi-shot.png /tmp/naomi-desk.png; sudo -n kill -USR2 $P; "
+                f"for i in $(seq 1 80); do [ -s {f} ] && break; sleep 0.1; done; "
+                f"base64 -w0 {f}", check=False, capture=True)
+    if p.returncode or not p.stdout:
+        die("снимок не получился (оболочка запущена? экран включён? стол ни разу не рисовался?)")
+    import base64
+    out_dir = os.path.join(REPORTS, "screens")
+    os.makedirs(out_dir, exist_ok=True)
+    name = (args[0] if args else time.strftime("desk-%Y%m%d-%H%M%S" if desk else "shot-%Y%m%d-%H%M%S")) + ".png"
+    path = os.path.join(out_dir, name)
+    with open(path, "wb") as f:
+        f.write(base64.b64decode(p.stdout))
+    print(os.path.relpath(path, ROOT))
+
+
+def cmd_mouse(args):
+    """Проверочная мышь стола: действия → вызовы org.naomi.DeskTest.Pointer одной пачкой на телефоне (gdbus)."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    call = ("gdbus call --session --dest org.naomi.DeskTest --object-path /input "
+            "--method org.naomi.DeskTest.Pointer {b} {x:.4f} {y:.4f} >/dev/null")
+    lines, buttons, x, y, i = [], 0, 0.5, 0.5, 0
+    toks = " ".join(args).split()
+    def num():
+        nonlocal i
+        i += 1
+        return float(toks[i - 1])
+    while i < len(toks):
+        t = toks[i]
+        i += 1
+        if t == "abs":
+            x, y = num(), num()
+        elif t == "press":
+            buttons |= 1
+        elif t == "release":
+            buttons &= ~1
+        elif t == "shift":
+            buttons |= 16
+        elif t == "noshift":
+            buttons &= ~16
+        elif t == "wait":
+            lines.append(f"sleep {num()}")
+            continue
+        elif t == "drag":   # к X Y за СЕК, шагами по 1/60 с
+            tx, ty, sec = num(), num(), num()
+            n = max(1, int(sec * 60))
+            for k in range(1, n + 1):
+                lines.append(call.format(b=buttons, x=x + (tx - x) * k / n, y=y + (ty - y) * k / n))
+                lines.append("sleep 0.0166")
+            x, y = tx, ty
+            continue
+        else:
+            die(f"не понял «{t}»: abs X Y, press, release, shift, noshift, drag X Y СЕК, wait СЕК")
+        lines.append(call.format(b=buttons, x=x, y=y))
+    ssh_run("export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/32011/bus; " + "; ".join(lines))
+
+
+def cmd_screens(args):
+    """«Экраны» (docs/SCREENS.md) без пальца и мыши — org.naomi.DeskTest на телефоне: список, положение экрана,
+    выключатель стола, жест пробуждения."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    call = ("export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/32011/bus; gdbus call --session --dest "
+            "org.naomi.DeskTest --object-path /input --method org.naomi.DeskTest.")
+    pos = {"off": 0, "нет": 0, "on": 1, "desk": 1, "стол": 1, "main": 2, "главный": 2}
+    if args and args[0] in ("desk", "стол") and len(args) == 2 and args[1] in ("on", "off"):
+        ssh_run(call + f"Desk {'true' if args[1] == 'on' else 'false'} >/dev/null")
+    elif args and args[0] == "wake" and len(args) == 2:
+        ssh_run(call + f"Wake {shlex.quote(args[1])} >/dev/null")
+    elif args and args[0] == "light" and len(args) == 3 and (args[2] == "auto" or args[2].isdigit()):
+        auto = args[2] == "auto"   # яркость экрана (планшета): сам по датчику света или уровень, %
+        ssh_run(call + f"ScreenLight {shlex.quote(args[1])} {'true' if auto else 'false'} {60 if auto else int(args[2])} >/dev/null")
+    elif len(args) == 2 and args[1] in pos:
+        ssh_run(call + f"ScreenPosition {shlex.quote(args[0])} {pos[args[1]]} >/dev/null")
+    elif args:
+        die("tools/naomi screens [ЭКРАН off|on|main] [desk on|off] [wake ЭКРАН] [light ЭКРАН auto|ПРОЦЕНТ]")
+    out = ssh_run(call + "Screens", capture=True).stdout.strip()
+    st = None
+    if out.startswith("('") and out.endswith("',)"):   # ответ gdbus: ('…JSON…',)
+        try:
+            st = json.loads(out[2:-3].replace("\\'", "'"))
+        except ValueError:
+            pass
+    if not st:
+        print(out)
+        return
+    print(f"стол {'включён' if st['desk'] else 'выключен'}; смотрят: {'да — ' + (st['viewer'] or '?') if st['connected'] else 'нет'}"
+          f"{'; панель и окна убраны' if st['away'] else ''}")
+    names = {"desk": "стол", "splash": "заставка", "offline": "нет связи", "standby": "спит"}
+    for s in st["screens"]:
+        mark = ["нет", "стол", "главный"][s["position"]]
+        light = "" if not s.get("light") else "; яркость — сам" if s.get("lightAuto") else f"; яркость {s.get('lightLevel')} %"
+        print(f"  {s['id']:<10} {names.get(s['state'], s['state']):<10} выбор: {mark:<8} {s.get('w', 0)}×{s.get('h', 0)} "
+              f"{s.get('kind', '')} «{s.get('name', '')}» через {s.get('viewer', '')}"
+              f"{' (' + s['route'] + ')' if s.get('route') else ''}{light}")
+
+
+def cmd_panel(args):
+    """Как дисплей кладёт кадр на панель — по журналу драйвера (sde_evtlog), а не по снимку: снимок рисует сцену
+    заново и ошибку составления не видит (16 ноября 2026: смеситель 720 × 1560, на экране угол кадра крупнее)."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    wait = float(args[0]) if args else 70   # в AOD кадр — раз в минуту
+    # blend_setup_mixer:1484 — строка ядра этого телефона с местом слоя: plane, fb, src x y w h, dst x y w h
+    p = ssh_run("sudo -n sh -c 'cd /sys/kernel/tracing && echo 0 > tracing_on && echo > trace && "
+                "echo 4096 > buffer_size_kb && echo 1 > events/sde/sde_evtlog/enable && echo 1 > tracing_on; "
+                f"for i in $(seq {int(wait * 10)}); do sleep 0.1; grep -q blend_setup_mixer trace && "
+                "{ sleep 0.3; break; }; done; echo 0 > tracing_on; echo 0 > events/sde/sde_evtlog/enable; "
+                "grep -E \"blend_setup_mixer:1484|program_lm_output_roi|dsc_setup\" trace'",
+                check=False, capture=True)
+    lm, layers, panel, last = [], [], None, None
+    for line in p.stdout.splitlines():
+        try:
+            ts = float(line.split("sde_evtlog:")[0].split()[-1].rstrip(":"))
+            tag, *f = line.split("sde_evtlog:")[1].strip().split("|")[1:]
+            f = [int(x, 16) for x in f]
+        except (IndexError, ValueError):
+            continue
+        if last is None or ts - last > 0.002:   # новая сборка кадра
+            if "dsc_setup" not in tag:
+                lm, layers = ([], layers) if "lm_output" in tag else (lm, [])
+        last = ts
+        if "lm_output" in tag:
+            lm = [x for x in lm if x[0] != f[1]] + [(f[1], f[2], f[3], f[4], f[5])]
+        elif "blend_setup" in tag:
+            layers.append(f[1:11])
+        elif "dsc_setup" in tag:
+            panel = (f[4], f[5])
+    if not layers or not lm:
+        die("кадров не было — экран выключен? (tools/naomi panel [сек] ждёт кадра столько секунд)")
+    mw, mh = sum(x[3] for x in lm), max(x[4] for x in lm)
+    print(f"смеситель {mw}×{mh} ({len(lm)} × {lm[0][3]})" + (f", панель {panel[0]}×{panel[1]}" if panel else ""))
+    fbs = {}
+    for plane, fb, sx, sy, sw, sh, dx, dy, dw, dh in layers:
+        a = fbs.setdefault(fb, [sx, sy, sx + sw, sy + sh, dx, dy, dx + dw, dy + dh])
+        a[:] = [min(a[0], sx), min(a[1], sy), max(a[2], sx + sw), max(a[3], sy + sh),
+                min(a[4], dx), min(a[5], dy), max(a[6], dx + dw), max(a[7], dy + dh)]
+    for fb, (sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1) in fbs.items():
+        print(f"слой (буфер {fb}): из кадра {sx0},{sy0} {sx1 - sx0}×{sy1 - sy0} → в смеситель {dx0},{dy0} "
+              f"{dx1 - dx0}×{dy1 - dy0}")
+    if panel and (mw, mh) != panel:
+        print(f"ВНИМАНИЕ: смеситель меньше панели — дисплей растягивает его целиком; место слоя обрезано по "
+              f"{mw}×{mh}")
+
+
+def cmd_stop():
+    ssh_run("sudo -n systemctl stop naomi-shell naomi-safe; systemctl is-active naomi-shell || true")
+
+
+def cmd_touchtest():
+    """Виртуальный палец ведёт круг 3 с (180 Гц, как сенсор); счётчики оболочки (NAOMI_TRACE)
+    показывают, сколько касаний пришло между соседними кадрами. Норма — ни одного кадра без касания."""
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    push(os.path.join(ROOT, "device", "touchinject.py"), f"{PHONE}/bin/touchinject.py")
+    os.environ["NAOMI_RUN_ENV"] = "NAOMI_TRACE=1"
+    cmd_run([])
+    time.sleep(3)
+    log = ssh_run(f"S=$(date '+%Y-%m-%d %H:%M:%S'); sudo -n python3 {PHONE}/bin/touchinject.py circle 3 "
+                  "2>/dev/null; sleep 1.2; journalctl -u naomi-shell --since \"$S\" --no-pager -o cat",
+                  capture=True).stdout
+    import re
+    frames = [0] * 5
+    for line in log.splitlines():
+        m = re.search(r"касаний (\d+) .*0/1/2/3/4\+ касаниями: (\d+)/(\d+)/(\d+)/(\d+)/(\d+)", line)
+        if m and int(m[1]) >= 150:          # целая секунда внутри жеста
+            frames = [a + int(b) for a, b in zip(frames, m.groups()[1:])]
+        if line.startswith(("naomi-trace", "naomi-frames")):
+            print(" ", line)
+    total = sum(frames)
+    if not total:
+        die("счётчики не увидели касаний (оболочка не подхватила виртуальный палец?)")
+    empty = frames[0] / total
+    print(f"кадров с 0/1/2/3/4+ касаниями: {'/'.join(map(str, frames))} — "
+          + ("ровно: каждый кадр получает касания" if empty < 0.05 else
+             f"РЫВКИ: {empty:.0%} кадров без касаний"))
+    os.environ["NAOMI_RUN_ENV"] = ""
+    cmd_run([])
+
+
+# Шрифты и значки интерфейса (docs/UI.md, «Шрифты»): лицензии OFL 1.1 и Apache 2.0, в git не лежат.
+# Чего нет в downloads/fonts — скачивается по этим адресам; SHA-256 сверяется всегда.
+FONTS_RAW = "https://raw.githubusercontent.com"
+FONTS = [
+    ("GoogleSans[GRAD,opsz,wght].ttf", "google/fonts/main/ofl/googlesans/GoogleSans%5BGRAD,opsz,wght%5D.ttf",
+     "d0a87d835a944b8b40d0e82a5651bb59ab97b936a2aeed5946eb57e7b2a3a90a"),
+    ("GoogleSansFlex[ROND,opsz,slnt,wdth,wght].ttf",
+     "google/fonts/main/ofl/googlesansflex/GoogleSansFlex%5BROND,opsz,slnt,wdth,wght%5D.ttf",
+     "a9ac770798857d5e8ac593ced42b22e40a7c08cec98319f92b0eccc2783a77ba"),
+    ("MaterialSymbolsRounded[FILL,GRAD,opsz,wght].ttf",
+     "google/material-design-icons/master/variablefont/MaterialSymbolsRounded%5BFILL,GRAD,opsz,wght%5D.ttf",
+     "7e74e36533ccee12c2b81e75bfcf3ccf123d3bb7e7e46d65d94445f23db0c97c"),
+    ("OFL-GoogleSans.txt", "google/fonts/main/ofl/googlesans/OFL.txt",
+     "2b75ef20f13d83a7514aee452c4782c20cdc9ff2dee17600f44d37a06d4fb958"),
+    ("OFL-GoogleSansFlex.txt", "google/fonts/main/ofl/googlesansflex/OFL.txt",
+     "fc13d69f63e36d284b6e383d4d1463d8ad404f0aa065e57cf961252d51063137"),
+    ("LICENSE-MaterialSymbols.txt", "google/material-design-icons/master/LICENSE",
+     "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd"),
+]
+
+
+def cmd_fonts():
+    """Шрифты и значки (downloads/fonts; нет — скачать; сверка SHA-256) → ~/.local/share/fonts/naomi, fc-cache."""
+    src = os.path.join(ROOT, "downloads", "fonts")
+    for name, url, sha in FONTS:
+        fetch(f"{FONTS_RAW}/{url}", os.path.join(src, name), sha)
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    dst = "/home/phablet/.local/share/fonts/naomi"
+    ssh_run(f"mkdir -p {dst}")
+    for name, _, _ in FONTS:
+        push(os.path.join(src, name), f"{dst}/{name}")
+    ssh_run("fc-cache -f >/dev/null 2>&1; fc-list : family | grep -E 'Google Sans|Material Symbols' | sort -u")
+
+
+def cmd_desktop_wallpaper(args):
+    """Обои рабочего стола → собрание «Настроек» → «Обои» (~/.config/naomi/desktop/wallpapers/имя.расширение) и
+    на стол (wallpaper.jpg, какие — wallpaper.conf, как делают сами «Настройки»). Картинки в git не кладутся,
+    только на телефон. Формат любой: Qt узнаёт его по содержимому."""
+    if not args:
+        die("укажите файл обоев: tools/naomi desktop-wallpaper файл [имя]")
+    src = os.path.abspath(args[0])
+    name = os.path.splitext(os.path.basename(src))[0]
+    if len(args) > 1:
+        name = args[1]
+    if not os.path.isfile(src):
+        die(f"нет файла {src}")
+    if "/" in name or name.startswith("."):
+        die(f"имя без «/» и не с точки: {name}")
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    dst = "/home/phablet/.config/naomi/desktop"
+    file = name + os.path.splitext(src)[1].lower()
+    ssh_run(f"mkdir -p {dst}/wallpapers")
+    push(src, shlex.quote(f"{dst}/wallpapers/{file}"))
+    ssh_run(f"cp {shlex.quote(f'{dst}/wallpapers/{file}')} {dst}/wallpaper.jpg "
+            f"&& printf '[General]\\ncurrent=%s\\n' {shlex.quote(file)} > {dst}/wallpaper.conf")
+    print(f"обои стола: {os.path.basename(src)} → {dst}/wallpapers/{file}, на столе — они (стол покажет их, когда "
+          "перечитает: при следующем запуске оболочки или выборе в «Обоях»)")
+
+
+# Словари клавиатуры (docs/KEYBOARD.md): частоты слов из субтитров OpenSubtitles 2018 — проект FrequencyWords
+# (hermitdave, CC BY-SA 4.0), в git не лежат. Нет в downloads/dict — скачиваются; SHA-256 сверяется.
+DICT_RAW = "https://raw.githubusercontent.com/hermitdave/FrequencyWords/master/content/2018"
+DICTS = {   # язык: файл, SHA-256, буквы (порядок = номера букв в дереве), не реже скольких раз
+    "ru": ("ru_full.txt", "32dfd94138aea2667ec455dcc8512029e39bd4b8ea70b09410d569b69d511a30",
+           "абвгдеёжзийклмнопрстуфхцчшщъыьэюя-", 3),
+    "en": ("en_50k.txt", "5351ff405b1126ef555791dd4d9798a48e3e9a501a9fc481a9da957752cfb458",
+           "abcdefghijklmnopqrstuvwxyz'-", 1),
+}
+
+
+def build_dict(path, alphabet, min_count):
+    """Список «слово частота» → дерево слов (shell/input/spell.h, «Словарь»): узлы в порядке обхода в ширину,
+    дети узла подряд. Узел — 8 байт: первый ребёнок u32, детей u8, буква u8, частота слова u8 (0 — не слово),
+    лучшая частота в поддереве u8. Частота — логарифм числа встреч, сжатый в 1…255."""
+    import math
+    import struct
+    index = {c: i for i, c in enumerate(alphabet)}
+    counts = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            w, c = parts[0].lower(), int(parts[1])
+            if c < min_count or not 0 < len(w) <= 24 or w[0] in "-'" or w[-1] in "-'":
+                continue
+            if all(ch in index for ch in w):
+                counts[w] = counts.get(w, 0) + c
+    words = sorted((tuple(index[ch] for ch in w), c) for w, c in counts.items())
+    lo_ln, hi_ln = math.log(min(counts.values())), math.log(max(counts.values()))
+    total_ln = math.log(sum(counts.values()))
+    q = lambda c: 1 + round(254 * (math.log(c) - lo_ln) / (hi_ln - lo_ln))
+    first, nkids, letter, freq = [0], [0], [0], [0]
+    queue = [(0, 0, 0, len(words))]   # узел, глубина, слова [lo, hi)
+    head = 0
+    while head < len(queue):
+        node, depth, lo, hi = queue[head]
+        head += 1
+        if lo < hi and len(words[lo][0]) == depth:   # слово кончается здесь (короткие — первыми)
+            freq[node] = q(words[lo][1])
+            lo += 1
+        first[node] = len(first)
+        i = lo
+        while i < hi:
+            ch = words[i][0][depth]
+            j = i
+            while j < hi and words[j][0][depth] == ch:
+                j += 1
+            first.append(0)
+            nkids.append(0)
+            letter.append(ch)
+            freq.append(0)
+            queue.append((len(first) - 1, depth + 1, i, j))
+            nkids[node] += 1
+            i = j
+    best = list(freq)
+    for node in range(len(first) - 1, -1, -1):
+        for k in range(first[node], first[node] + nkids[node]):
+            best[node] = max(best[node], best[k])
+    abc = alphabet.encode("utf-32-le")
+    out = [b"NDIC", struct.pack("<IIIfff", 1, len(first), len(alphabet), lo_ln, hi_ln, total_ln), abc]
+    out += [struct.pack("<IBBBB", first[n], nkids[n], letter[n], freq[n], best[n]) for n in range(len(first))]
+    return b"".join(out), len(words), len(first)
+
+
+def cmd_dict():
+    """Словари клавиатуры: сверка SHA-256 → дерево слов → ~/.local/share/naomi/dict/<язык>.ndict на телефоне."""
+    src = os.path.join(ROOT, "downloads", "dict")
+    built = []
+    for lang, (name, sha, alphabet, min_count) in DICTS.items():
+        path = os.path.join(src, name)
+        fetch(f"{DICT_RAW}/{lang}/{name}", path, sha)
+        data, n, nodes = build_dict(path, alphabet, min_count)
+        out = os.path.join(src, f"{lang}.ndict")
+        with open(out, "wb") as f:
+            f.write(data)
+        print(f"{lang}: {n} слов, {nodes} узлов, {len(data) / 1e6:.1f} МБ")
+        built.append(out)
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    dst = "/home/phablet/.local/share/naomi/dict"
+    ssh_run(f"mkdir -p {dst}")
+    for out in built:
+        push(out, f"{dst}/{os.path.basename(out)}")
+    print(f"на телефоне: {dst}")
+
+
+# ---------- реклама и слежка: EasyList, EasyPrivacy → правила для перехватчика браузера (web_filter.cpp) ----------
+# Списки — в downloads/filters (нет — скачиваются): https://easylist.to/easylist/easylist.txt и
+# https://easylist.to/easylist/easyprivacy.txt (обновляются ежедневно — суммы не сверяются, версия — в заголовке).
+# Берутся только правила на целый домен — `||домен^` и `@@||домен^` с понятными условиями; правила с путём, косметика
+# (`##`) и правила под отдельные сайты (`domain=` у блокирующих) — нет. Строки результата:
+#   b домен [3] [t=типы]   блокировать (3 — только сторонние запросы)
+#   a домен [t=типы] [on=сайты]   не блокировать (исключение; on — только на этих сайтах)
+#   s домен                не блокировать ничего на страницах этого сайта ($document)
+FILTER_TYPES = {"script": "script", "image": "image", "stylesheet": "css", "css": "css", "xmlhttprequest": "xhr",
+                "xhr": "xhr", "subdocument": "frame", "frame": "frame", "media": "media", "font": "font",
+                "object": "object", "ping": "ping", "websocket": "websocket", "other": "other"}
+FILTER_IGNORE = {"important", "match-case"}
+
+
+def compile_filters(lines):
+    import re
+    rule = re.compile(r"^(@@)?\|\|([a-z0-9.-]+\.[a-z0-9-]+)\^(?:\$(.*))?$")
+    block, allow, site = {}, {}, set()
+    for line in lines:
+        m = rule.match(line.strip())
+        if not m:
+            continue
+        exception, host, opts = m.group(1) is not None, m.group(2), m.group(3)
+        third, types, on, skip, document = False, set(), set(), False, False
+        for o in (opts.split(",") if opts else []):
+            o = o.strip()
+            if o in FILTER_IGNORE:
+                continue
+            if o in ("third-party", "3p"):
+                third = True
+            elif o in FILTER_TYPES:
+                types.add(FILTER_TYPES[o])
+            elif o == "all":
+                types.clear()
+            elif o == "document" and exception:
+                document = True
+            elif o.startswith("domain=") and exception:
+                on |= {d for d in o[7:].split("|") if d and not d.startswith("~")}
+                skip |= not on
+            else:
+                skip = True   # ~third-party, ~script, domain= у блокирующих, popup, csp, redirect, removeparam…
+        if skip:
+            continue
+        if exception:
+            if document and not types and not on:
+                site.add(host)
+            elif not document:
+                r = allow.setdefault(host, {"types": set(), "all": False, "on": set(), "everywhere": False})
+                r["all"] |= not types
+                r["types"] |= types
+                r["everywhere"] |= not on
+                r["on"] |= on
+        else:
+            r = block.setdefault(host, {"types": set(), "all": False, "third": True})
+            r["all"] |= not types
+            r["types"] |= types
+            r["third"] &= third
+    out = []
+    for h, r in sorted(block.items()):
+        out.append("b " + h + (" 3" if r["third"] else "") + ("" if r["all"] else " t=" + ",".join(sorted(r["types"]))))
+    for h, r in sorted(allow.items()):
+        out.append("a " + h + ("" if r["all"] else " t=" + ",".join(sorted(r["types"])))
+                   + ("" if r["everywhere"] else " on=" + ",".join(sorted(r["on"]))))
+    out += ["s " + h for h in sorted(site)]
+    return out, len(block), len(allow), len(site)
+
+
+def cmd_web_filters():
+    src = os.path.join(ROOT, "downloads", "filters")
+    lines, head = [], []
+    for name in ("easylist.txt", "easyprivacy.txt"):
+        path = os.path.join(src, name)
+        fetch(f"https://easylist.to/easylist/{name}", path)
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read().splitlines()
+        version = next((l.split(":", 1)[1].strip() for l in text[:20] if l.startswith("! Version:")), "?")
+        head.append(f"{name[:-4]} {version}")
+        lines += text
+    out, nb, na, ns = compile_filters(lines)
+    built = os.path.join(src, "filters.txt")
+    with open(built, "w") as f:
+        f.write("# naomi-web: реклама и слежка — " + ", ".join(head) + " (tools/naomi web-filters)\n")
+        f.write("\n".join(out) + "\n")
+    print(f"{', '.join(head)}: блокировать {nb} доменов, исключений {na}, сайтов без блокировки {ns}; "
+          f"{os.path.getsize(built) / 1e6:.1f} МБ")
+    if not ssh_ok():
+        die("нужен SSH (tools/naomi access)")
+    dst = "/home/phablet/.local/share/naomi/web"
+    ssh_run(f"mkdir -p {dst}")
+    push(built, f"{dst}/filters.txt")
+    print(f"на телефоне: {dst}/filters.txt — браузер берёт его при запуске")
+
+
+def cmd_shell(args):
+    need_device()
+    sys.exit(subprocess.call(["adb", "shell", *args]))
+
+
+def cmd_ssh(args):
+    sys.exit(subprocess.call(ssh_argv(*args, tty=not args and sys.stdin.isatty())))
+
+
+def cmd_access():
+    need_device()
+    if not os.path.isfile(SSH_KEY):   # свой ключ для телефона и приставки: лежит в private/ssh, в git не идёт
+        os.makedirs(SSH_DIR, mode=0o700, exist_ok=True)
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "naomiphone", "-f", SSH_KEY], check=True)
+        print(f"создан ключ {SSH_KEY}")
+    key = open(SSH_KEY + ".pub").read().strip()
+    adb("shell", f"umask 077; mkdir -p ~/.ssh; grep -qxF '{key}' ~/.ssh/authorized_keys 2>/dev/null"
+                 f" || echo '{key}' >> ~/.ssh/authorized_keys")
+    adb("push", os.path.join(ROOT, "device", "dev-access.sh"), "/tmp/naomi-dev-access.sh")
+    if ssh_ok():
+        print("SSH по ключу уже работает: tools/naomi ssh")
+    else:
+        print("ключ на телефоне. Осталось один раз (пароль телефона вводит пользователь):\n"
+              "  adb shell -t sudo sh /tmp/naomi-dev-access.sh")
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd, args = sys.argv[1], sys.argv[2:]
+    if cmd == "probe":
+        cmd_probe(args)
+    elif cmd == "shell":
+        cmd_shell(args)
+    elif cmd == "ssh":
+        cmd_ssh(args)
+    elif cmd == "test":
+        cmd_test(args)
+    elif cmd == "stress":
+        cmd_stress(args)
+    elif cmd == "gamesoak":
+        cmd_gamesoak(args)
+    elif cmd == "build":
+        cmd_build()
+    elif cmd == "install":
+        cmd_install(args)
+    elif cmd == "run":
+        cmd_run(args)
+    elif cmd == "stop":
+        cmd_stop()
+    elif cmd == "shot":
+        cmd_shot(args)
+    elif cmd == "mouse":
+        cmd_mouse(args)
+    elif cmd == "screens":
+        cmd_screens(args)
+    elif cmd == "panel":
+        cmd_panel(args)
+    elif cmd == "touchtest":
+        cmd_touchtest()
+    elif cmd == "access":
+        cmd_access()
+    elif cmd == "usb":
+        cmd_usb(args)
+    elif cmd == "setup":
+        cmd_setup()
+    elif cmd == "devroot":
+        cmd_devroot()
+    elif cmd == "lomiri":
+        cmd_lomiri(args)
+    elif cmd == "phone":
+        cmd_phone()
+    elif cmd == "blackbox":
+        cmd_blackbox(sys.argv[2:])
+    elif cmd == "android":
+        cmd_android(args)
+    elif cmd == "cores":
+        cmd_cores(args)
+    elif cmd == "wine":
+        cmd_wine(args)
+    elif cmd == "claude":
+        cmd_claude(args)
+    elif cmd == "fonts":
+        cmd_fonts()
+    elif cmd == "desktop-wallpaper":
+        cmd_desktop_wallpaper(args)
+    elif cmd == "dict":
+        cmd_dict()
+    elif cmd == "web-filters":
+        cmd_web_filters()
+    else:
+        die(f"нет команды {cmd} (tools/naomi help)")
+
+
+if __name__ == "__main__":
+    main()

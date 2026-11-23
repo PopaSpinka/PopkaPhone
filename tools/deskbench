@@ -1,0 +1,1949 @@
+#!/usr/bin/env python3
+"""НаомиФон — прогон рабочего стола (docs/DESKTOP.md, «Прогон стола»): проверочная мышь приставки прокликивает все
+окна стола по сценарию, а три стороны пишут каждый кадр и нагрузку — и разбор по шагам: где стол не держит частоту
+монитора, кто в этом виноват и чего это стоило телефону.
+
+  tools/deskbench run [шаг …]       прогон (по умолчанию — все шаги по порядку) → reports/deskbench-ДАТА/report.txt
+  tools/deskbench list              шаги сценария
+  tools/deskbench again ПАПКА       разобрать записанное снова
+  tools/deskbench compare A B       сравнить два прогона по шагам (было → стало)
+  tools/deskbench scene [слово …]   что сейчас в сцене стола (зонд): элементы, где лежат, их строки — для сценариев
+  tools/deskbench history save|restore   история браузера и шаг web-heavy: тот заходит на свои страницы, и они
+                                    попадают в историю и «Часто». save — копия до серии прогонов, restore — после
+                                    (браузер закрыт: tools/naomi run): свои адреса — как были в копии или прочь
+
+Кто что пишет (часы — CLOCK_MONOTONIC каждой стороны; сдвиг телефон−Pi — из трассы приставки):
+  приставка  — свой экземпляр naomi-dock (служба на время прогона остановлена): каждый кадр — снят, сжат, пришёл,
+               распакован, на экране или выброшен, к какому обновлению монитора (NAOMI_DOCK_TRACE); такты и мышь
+               (NAOMI_DOCK_PTRACE); проверочная мышь (pi/tools/vinput.py --stdin) — метки начала и конца шагов;
+  телефон    — трасса кадров стола (зонд org.naomi.DeskTest /probe, Trace): такт пришёл в поток интерфейса, сцена
+               попросила кадр, кадр и его части; сборщик device/desksampler.py — ядра, частоты, видеочип, мощность,
+               тепло, память, процессы и потоки оболочки; журнал оболочки (ошибки QML за прогон).
+Разбор шага: монитор (сколько обновлений получили новый кадр, повторы, выброшенные, задержка до экрана), телефон
+(кадры стола и их цена, рывки — кадр позже такта, — и откуда: поток интерфейса занят или сцена не просила; такт в
+потоке интерфейса — на сколько позже, чем пришёл бы), система (ядра, частоты, видеочип, Вт, °C, кто ест).
+
+DESKBENCH_XRAY=1 — прогон с «рентгеном» (tools/xray, docs/XRAY.md): трасса ядра телефона на весь прогон, а разбор —
+по шагам (кто на каких ядрах работал, кто кого ждал) → xray/ в папке прогона, шаг — `tools/xray step ПАПКА/xray шаг`.
+Чтобы замер не мерил сам себя, выборки стека выключены (вернуть — DESKBENCH_SAMPLE=1), сборщик — раз в секунду и без
+процессов.
+
+Перед прогоном: стол смотрит приставка, браузер может быть закрыт (сценарий откроет). Звук браузера на время прогона
+заглушён (его потоки PulseAudio, громкости пользователя не трогаются). Скриншоты сценария удаляются в конце.
+"""
+import bisect
+import contextlib
+import csv
+import importlib.machinery
+import importlib.util
+import json
+import os
+import statistics
+import subprocess
+import sys
+import threading
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PHONE_DIR = "/tmp/deskbench"
+PI_DIR = "/tmp/deskbench"
+VINPUT = "naomi-pi/src/pi/tools/vinput.py"
+BUS = "export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/32011/bus; "
+PROBE = "gdbus call --session --dest org.naomi.DeskTest --object-path /probe --method org.naomi.DeskTest."
+MOUSE_HZ = 62.5    # мышь пользователя — CX 2.4G, ровно 62,5 Гц (docs/PI.md, «Мышь»)
+MONITOR_W = 2560   # пикселей монитора по ширине: ход мыши в отсчётах ≈ пиксели монитора (ускорение ~1)
+
+
+def load(name):
+    loader = importlib.machinery.SourceFileLoader(name, os.path.join(ROOT, "tools", name))
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+os.environ.setdefault("NAOMI_VIA", "wifi")   # кабель телефона — у Pi; к телефону — по Wi-Fi
+NAOMI = load("naomi")
+PI = load("pi")
+
+
+def phone(cmd, check=True, input=None):
+    p = subprocess.run(NAOMI.ssh_argv(cmd), capture_output=True, text=True, input=input)
+    if check and p.returncode:
+        sys.exit(f"на телефоне не вышло: {cmd[:100]}\n{p.stderr}")
+    return p.stdout
+
+
+def pi(cmd, check=True):
+    p = subprocess.run(PI.SSH + [f"naomi@{PI.HOST}", cmd], capture_output=True, text=True)
+    if check and p.returncode:
+        sys.exit(f"на Pi не вышло: {cmd[:100]}\n{p.stderr}")
+    return p.stdout
+
+
+# --- сцена стола (зонд) ---------------------------------------------------------------------------------------------
+
+class Scene:
+    def __init__(self, data):
+        self.w, self.h = data["desk"]
+        self.items = data["items"]
+
+    def find(self, t=None, id=None, inn=None, text=None, f=None, **props):
+        out = []
+        for i in self.items:
+            p = i.get("p", {})
+            if t and i["t"] != t:
+                continue
+            if id and i.get("id") != id:
+                continue
+            if inn and i.get("in") != inn and i.get("id") != inn:
+                continue
+            if f and not i.get("f", "").startswith(f):
+                continue
+            if text is not None and p.get("text") != text:
+                continue
+            if any(p.get(k) != v for k, v in props.items()):
+                continue
+            x, y, w, h = i["r"]
+            if x + w <= 0 or y + h <= 0 or x >= self.w or y >= self.h:   # за краем стола (запас окна)
+                continue
+            out.append(i)
+        return out
+
+    def one(self, **kw):
+        found = self.find(**kw)
+        if not found:
+            raise LookupError(f"в сцене нет {kw}")
+        return found[0]
+
+
+def scene():
+    phone(BUS + PROBE + f"Scene {PHONE_DIR}/scene.json >/dev/null; true")
+    return Scene(json.loads(phone(f"cat {PHONE_DIR}/scene.json")))
+
+
+def center(item):
+    x, y, w, h = item["r"]
+    return x + w / 2, y + h / 2
+
+
+# --- прогон ---------------------------------------------------------------------------------------------------------
+
+class Bench:
+    def __init__(self, out):
+        self.out = out
+        self.vin = None
+        self.sc = None
+        self.notes = []
+        self.dw, self.dh = 1800, 1012
+
+    # мышь приставки
+    def send(self, *cmds):
+        line = " ".join(str(c) for c in cmds)
+        self.vin.stdin.write(line + "\n")
+        self.vin.stdin.flush()
+        ok = self.vin.stdout.readline()
+        if ok.strip() != "ok":
+            raise RuntimeError(f"мышь приставки не ответила на «{line[:60]}»: {ok!r}")
+
+    def look(self):
+        """сцена сейчас (зонд — в потоке интерфейса, ~10–40 мс: только между шагами, не внутри)"""
+        self.sc = scene()
+        self.dw, self.dh = self.sc.w, self.sc.h
+        time.sleep(0.25)
+        return self.sc
+
+    def frac(self, x, y):
+        return f"{min(max(x / self.dw, 0), 0.9999):.4f} {min(max(y / self.dh, 0), 0.9999):.4f}"
+
+    def to(self, target, dx=0, dy=0):
+        x, y = center(target) if isinstance(target, dict) else target
+        self.send("abs", self.frac(x + dx, y + dy), "wait 0.03")
+
+    def click(self, target, wait=0.4, dx=0, dy=0):
+        self.to(target, dx, dy)
+        self.send("press wait 0.06 release wait", wait)
+
+    def dclick(self, target, wait=0.5):
+        self.to(target)
+        self.send("press wait 0.05 release wait 0.08 press wait 0.05 release wait", wait)
+
+    def right(self, target, wait=0.5):
+        self.to(target)
+        self.send("right wait", wait)
+
+    def hover(self, targets, dwell=0.25):
+        for t in targets:
+            self.to(t)
+            self.send("wait", dwell)
+
+    def counts(self, pts, sec):
+        """отсчётов мыши за отчёт, чтобы пройти pts точек стола за sec"""
+        return round(pts * MONITOR_W / self.dw / max(1, sec * MOUSE_HZ))
+
+    def drag(self, start, dx, dy, sec, back=True, hold=0.15):
+        """зажать в start, протащить на dx, dy точек за sec (мышью, как рукой), отпустить; back — и обратно"""
+        self.to(start)
+        cx, cy = self.counts(dx, sec), self.counts(dy, sec)
+        cmds = ["press", "wait", hold, "rel", cx, cy, sec]
+        if back:
+            cmds += ["wait", 0.1, "rel", -cx, -cy, sec]
+        self.send(*cmds, "wait", 0.1, "release", "wait", 0.4)
+
+    def circle(self, sec, r=6):
+        self.send("circle", r, sec)
+
+    def wheel(self, target, n, rate=10):
+        self.to(target)
+        self.send("wheel", n, rate, "wait 0.5")
+
+    def key(self, *codes, wait=0.4):
+        """сочетание: зажать по порядку, отпустить обратно (Shift 42, Alt 56, Esc 1, пробел 57, 3 — 4, 4 — 5)"""
+        self.send(*[f"down {c}" for c in codes], "wait 0.05", *[f"up {c}" for c in reversed(codes)], "wait", wait)
+
+    @contextlib.contextmanager
+    def step(self, name):
+        self.send("mark", f"{name}:start")
+        t0 = time.time()
+        try:
+            yield
+        finally:
+            self.send("mark", f"{name}:end")
+            print(f"  {name}: {time.time() - t0:.1f} с", flush=True)
+
+    def note(self, text):
+        print(f"  ! {text}", flush=True)
+        self.notes.append(text)
+
+
+# сценарий: шаги по порядку; каждый сам находит своё в сцене (зонд) и сам убирает за собой
+
+def window(sc, t):
+    return sc.one(t=t)
+
+
+def win_button(sc, win, glyph):
+    x, y, w, h = win["r"]
+    for b in sc.find(t="WinButton", glyph=glyph):
+        bx, by, _, _ = b["r"]
+        if x <= bx <= x + w and y <= by <= y + 45:
+            return b
+    raise LookupError(f"нет кнопки {glyph} у {win['t']}")
+
+
+def title_spot(sc, win):
+    """пустое место полосы окна: правее заголовка, левее кнопок"""
+    x, y, w, h = win["r"]
+    buttons = [b["r"][0] for b in sc.find(t="WinButton") if x <= b["r"][0] <= x + w and y <= b["r"][1] <= y + 45]
+    right = min([bx for bx in buttons if bx > x + w * 0.5] or [x + w - 100])
+    return (right - 60, y + 20)
+
+
+def ensure_closed(b, t):
+    sc = b.look()
+    for win in sc.find(t=t):
+        if win["r"][2] > 0:
+            b.click(win_button(sc, win, "close"), wait=0.6)
+            sc = b.look()
+
+
+def s_idle(b):
+    with b.step("покой"):
+        b.send("wait 4")
+
+
+def s_cursor(b):
+    b.to((b.dw * 0.6, b.dh * 0.6))
+    with b.step("курсор"):
+        b.circle(3)
+
+
+def s_panel(b):
+    sc = b.look()
+    bar = [i for i in sc.find(t="BarItem")]
+    with b.step("панель.наведение"):
+        b.hover(bar + list(reversed(bar)), dwell=0.2)
+
+
+def s_nmenu(b):
+    sc = b.look()
+    n = sc.one(id="nItem")
+    with b.step("меню-N.открыть-закрыть"):
+        for _ in range(3):
+            b.click(n, wait=0.5)
+            b.click(n, wait=0.5)
+    b.click(n, wait=0.6)
+    sc = b.look()
+    tiles = sc.find(t="Item", id="tile")
+    with b.step("меню-N.плитки"):
+        b.hover(tiles + list(reversed(tiles)), dwell=0.15)
+    b.send("key 1 wait 0.5")
+    if b.look().find(t="NMenu"):
+        b.click(n, wait=0.5)
+
+
+def files_open(b):
+    sc = b.look()
+    if not sc.find(t="FilesWindow"):
+        b.click(sc.one(id="fileItem"), wait=1.0)
+        sc = b.look()
+    return sc, window(sc, "FilesWindow")
+
+
+def s_files(b):
+    ensure_closed(b, "FilesWindow")
+    sc = b.look()
+    with b.step("файлы.открыть"):
+        b.click(sc.one(id="fileItem"), wait=1.0)
+    sc = b.look()
+    win = window(sc, "FilesWindow")
+    rows = sc.find(id="row")
+    with b.step("файлы.наведение-строк"):
+        b.hover(rows[:8] + list(reversed(rows[:8])), dwell=0.12)
+    # папка с картинками и роликами — test-media (naomi → test-media), иначе Pictures
+    target = next((r for r in rows if r.get("p", {}).get("name") == "naomi"), None)
+    with b.step("файлы.папки"):
+        if target:
+            b.dclick(target, wait=0.8)
+            sc2 = b.look()
+            tm = next((r for r in sc2.find(id="row") if r.get("p", {}).get("name") == "test-media"), None)
+            if tm:
+                b.dclick(tm, wait=0.8)
+        else:
+            b.dclick(rows[0], wait=0.8)
+    sc = b.look()
+    win = window(sc, "FilesWindow")
+    rows = sc.find(id="row")
+    with b.step("файлы.колесо"):
+        lv = sc.one(id="listView") if sc.find(id="listView") else win
+        b.wheel(lv, -8, 10)
+        b.wheel(lv, 8, 10)
+    with b.step("файлы.вид-сетка-список"):
+        grid = win_button(sc, win, "grid")
+        b.click(grid, wait=0.7)
+        sc2 = b.look()
+        b.click(win_button(sc2, window(sc2, "FilesWindow"), "list") if sc2.find(t="WinButton", glyph="list") else grid,
+                wait=0.7)
+    sc = b.look()
+    win = window(sc, "FilesWindow")
+    rows = sc.find(id="row")
+    pic = next((r for r in rows if r.get("p", {}).get("name", "").lower().endswith((".jpg", ".png", ".jpeg"))), None)
+    vid = next((r for r in rows if r.get("p", {}).get("name", "").lower().endswith((".mp4", ".mkv", ".webm", ".mov"))), None)
+    if pic:
+        with b.step("просмотр.фото"):
+            b.click(pic, wait=0.3)
+            b.send("key 57 wait 1.2")
+            b.send("key 1 wait 0.8")
+    if vid:
+        with b.step("просмотр.видео"):
+            b.click(vid, wait=0.3)
+            b.send("key 57 wait 3.0")
+            b.send("key 1 wait 0.8")
+    if rows:
+        with b.step("файлы.меню-правой"):
+            b.right(rows[0], wait=0.6)
+            b.send("key 1 wait 0.5")
+    sc = b.look()
+    win = window(sc, "FilesWindow")
+    with b.step("файлы.тащить"):
+        b.drag(title_spot(sc, win), 300, 120, 1.0)
+    sc = b.look()
+    win = window(sc, "FilesWindow")
+    x, y, w, h = win["r"]
+    with b.step("файлы.размер-угол"):
+        b.drag((x + w + 3, y + h + 3), 160, 100, 1.0)
+    with b.step("файлы.размер-край"):
+        b.drag((x + w + 3, y + h / 2), -150, 0, 0.8)
+    sc = b.look()
+    win = window(sc, "FilesWindow")
+    with b.step("файлы.развернуть"):
+        b.click(win_button(sc, win, "maximize"), wait=0.8)
+        sc2 = b.look()
+        w2 = window(sc2, "FilesWindow")
+        btn = sc2.find(t="WinButton", glyph="restore") or [win_button(sc2, w2, "maximize")]
+        b.click(btn[0], wait=0.8)
+    sc = b.look()
+    win = window(sc, "FilesWindow")
+    with b.step("файлы.двойной-по-полосе"):
+        b.dclick(title_spot(sc, win), wait=0.8)
+        sc2 = b.look()
+        b.dclick(title_spot(sc2, window(sc2, "FilesWindow")), wait=0.8)
+    sc = b.look()
+    win = window(sc, "FilesWindow")
+    with b.step("файлы.свернуть-вернуть"):
+        b.click(win_button(sc, win, "minimize"), wait=0.8)
+        b.click(sc.one(id="fileItem"), wait=0.8)
+    sc = b.look()
+    with b.step("файлы.закрыть"):
+        b.click(win_button(sc, window(sc, "FilesWindow"), "close"), wait=0.8)
+
+
+def s_files_cycle(b):
+    """открыть-закрыть 8 раз (окно открывается там, где закрыли): рывки повторного открытия и рост памяти"""
+    ensure_closed(b, "FilesWindow")
+    sc = b.look()
+    fi = sc.one(id="fileItem")
+    b.click(fi, wait=1.0)
+    sc = b.look()
+    close = win_button(sc, window(sc, "FilesWindow"), "close")
+    b.click(close, wait=0.8)
+    with b.step("файлы.цикл-8"):
+        for _ in range(8):
+            b.click(fi, wait=0.9)
+            b.click(close, wait=0.7)
+    ensure_closed(b, "FilesWindow")
+
+
+def web_window(sc):
+    found = sc.find(t="WebWindow")
+    return found[0] if found else None
+
+
+def s_web(b):
+    sc = b.look()
+    with b.step("браузер.открыть"):
+        b.click(sc.one(id="webItem"), wait=3.0)
+    sc = b.look()
+    win = web_window(sc)
+    if not win:
+        b.note("браузер не открылся — шаги браузера пропущены")
+        return
+    x, y, w, h = win["r"]
+    page = (x + w * 0.5, y + h * 0.6)
+    with b.step("браузер.колесо"):
+        b.wheel(page, -12, 8)
+        b.wheel(page, 12, 8)
+    with b.step("браузер.тащить"):
+        b.drag(title_spot(sc, win), 250, 80, 1.0)
+    sc = b.look()
+    win = web_window(sc)
+    x, y, w, h = win["r"]
+    with b.step("браузер.размер-угол"):
+        b.drag((x + w + 3, y + h + 3), -160, -90, 1.0)
+    sc = b.look()
+    win = web_window(sc)
+    with b.step("браузер.развернуть"):
+        b.dclick(title_spot(sc, win), wait=1.0)
+        sc2 = b.look()
+        b.dclick(title_spot(sc2, web_window(sc2)), wait=1.0)
+    sc = b.look()
+    win = web_window(sc)
+    plus = sc.find(glyph="plus") or sc.find(glyph="add")
+    if plus:
+        with b.step("браузер.новая-вкладка"):
+            b.click(plus[0], wait=1.2)
+            b.send("key 1 wait 0.3")
+    sc = b.look()
+    win = web_window(sc)
+    with b.step("браузер.свернуть-вернуть"):
+        try:
+            b.click(win_button(sc, win, "minimize"), wait=0.8)
+        except LookupError:
+            b.click(sc.one(id="webItem"), wait=0.8)
+        b.click(sc.one(id="webItem"), wait=1.0)
+
+
+def s_video_load(b):
+    """тяжёлый случай пользователя: в браузере играет ролик (вкладка YouTube), а на столе — меню, окна, перетаскивание.
+    Ролик — щелчок по середине плеера (играет/пауза); играет ли — видно по нагрузке Chromium в отчёте"""
+    sc = b.look()
+    win = web_window(sc)
+    if not win:
+        b.click(sc.one(id="webItem"), wait=3.0)
+        sc = b.look()
+        win = web_window(sc)
+    if not win:
+        b.note("видео: браузер не открылся")
+        return
+    x, y, w, h = win["r"]
+    player = (x + w * 0.33, y + h * 0.35)
+    b.click(player, wait=3.0)
+    with b.step("видео.играет-покой"):
+        b.send("wait 3")
+    sc = b.look()
+    n = sc.one(id="nItem")
+    with b.step("видео.меню-N"):
+        for _ in range(3):
+            b.click(n, wait=0.5)
+            b.click(n, wait=0.5)
+    ensure_closed(b, "FilesWindow")
+    sc = b.look()
+    with b.step("видео.файлы-открыть"):
+        b.click(sc.one(id="fileItem"), wait=1.0)
+    sc = b.look()
+    f = window(sc, "FilesWindow")
+    with b.step("видео.файлы-тащить"):
+        b.drag(title_spot(sc, f), 300, 100, 1.2)
+    sc = b.look()
+    with b.step("видео.файлы-закрыть"):
+        b.click(win_button(sc, window(sc, "FilesWindow"), "close"), wait=0.8)
+    sc = b.look()
+    win = web_window(sc)
+    if win:
+        x, y, w, h = win["r"]
+        b.click((x + w * 0.33, y + h * 0.35), wait=0.8)   # пауза
+
+
+def web_cmd(message=None):
+    """команда браузеру стола через зонд (Web) — и что у него за вкладки сейчас"""
+    arg = json.dumps(message, ensure_ascii=False) if message else ""
+    out = phone(BUS + PROBE + "Web '" + arg.replace("'", "") + "'", check=False).strip()
+    try:
+        return json.loads(eval(out)[0])   # gdbus: ('{…}',)
+    except Exception:
+        return {"connected": False, "tabs": []}
+
+
+def web_go(b, url, settle=6.0, new=False):
+    """открыть адрес в активной вкладке (new — в новой) и дождаться конца загрузки (до 25 с), потом — settle секунд
+    покоя; ответ — номер вкладки"""
+    web_cmd({"type": "new-tab" if new else "navigate", "text": url})
+    st = {}
+    for _ in range(50):
+        time.sleep(0.5)
+        st = web_cmd()
+        act = [t for t in st["tabs"] if t["id"] == st.get("active")]
+        if act and not act[0]["loading"] and url.split("//")[-1].lstrip("/")[:12] in act[0]["url"]:
+            break
+    else:
+        b.note(f"страница не догрузилась: {url}")
+    b.send("wait", settle)
+    return st.get("active")
+
+
+def sound_playing():
+    """играет ли что-то в PulseAudio телефона (поток не на паузе) — так видно, идёт ли ролик"""
+    return phone("export XDG_RUNTIME_DIR=/run/user/32011; pactl list sink-inputs 2>/dev/null | grep -c 'Corked: no'; true"
+                 ).strip() not in ("", "0")
+
+
+# Тяжёлый браузер (разбор сверху вниз, docs/AUDIT.md, этап 1): всегда одно и то же — длинная статья и ролик
+# 1080p60 H.264 с диска телефона (~/naomi/test-media/h264-1080p60.mp4: 40 с, 6 Мбит/с, тихий тон — по звуку видно, что
+# играет; сделан ffmpeg: testsrc2 с шумом). Не YouTube: тот сам выбирает качество и частоту кадров, и сеть шумит.
+# Заходы пишутся в историю браузера — после серии прогонов убрать (docs/WEB.md)
+HEAVY_PAGE = "https://ru.wikipedia.org/wiki/Linux"
+HEAVY_LOAD = "https://www.youtube.com/"
+HEAVY_VIDEO = "file:///home/phablet/naomi/test-media/h264-1080p60.mp4"
+# DESKBENCH_YOUTUBE=1 — следом настоящий YouTube (качество и частоту кадров он выбирает сам: числа — для сверки, не
+# для сравнения прогонов)
+HEAVY_YOUTUBE = "https://www.youtube.com/watch?v=aqz-KE-bpKQ"
+
+
+def s_web_heavy(b):
+    sc = b.look()
+    win = web_window(sc)
+    if not win:
+        b.click(sc.one(id="webItem"), wait=3.0)
+        sc = b.look()
+        win = web_window(sc)
+    if not win:
+        b.note("тяжёлый браузер: браузер не открылся")
+        return
+    x, y, w, h = win["r"]
+    page = (x + w * 0.5, y + h * 0.6)
+    # своя вкладка: вкладки пользователя не трогаем, свою в конце закрываем
+    mine = web_go(b, HEAVY_PAGE, settle=3.0, new=True)
+    try:
+        heavy_steps(b, sc, win, page)
+    finally:
+        if mine is not None:
+            web_cmd({"type": "close", "id": mine})
+            b.send("wait 0.5")
+
+
+def heavy_steps(b, sc, win, page):
+    x, y, w, h = win["r"]
+    # страница грузится (главная YouTube: секунды скриптов на больших ядрах), а на столе открывают и закрывают меню —
+    # держит ли стол такт, пока браузер занят
+    n = sc.one(id="nItem")
+    web_cmd({"type": "navigate", "text": HEAVY_LOAD})
+    with b.step("загрузка.меню-N"):
+        for _ in range(4):
+            b.click(n, wait=0.5)
+            b.click(n, wait=0.5)
+    web_go(b, HEAVY_PAGE, settle=3.0)
+    with b.step("страница.колесо"):
+        b.wheel(page, -40, 20)
+        b.wheel(page, 40, 20)
+    b.to(page)
+    with b.step("страница.курсор"):
+        b.circle(3)
+    with b.step("страница.окно-тащить"):
+        b.drag(title_spot(sc, win), 250, 80, 1.0)
+    web_go(b, HEAVY_VIDEO, settle=2.0)
+    player = (x + w * 0.5, y + h * 0.45)
+    if not sound_playing():
+        b.click(player, wait=3.0)
+    if not sound_playing():
+        b.note("ролик не заиграл — шаги ролика без него")
+    b.to((x + w * 0.9, y + h * 0.9))   # курсор прочь с плеера: полоса управления прячется
+    with b.step("ролик.играет"):
+        b.send("wait 6")
+    b.to(page)
+    with b.step("ролик.курсор"):
+        b.circle(3)
+    with b.step("ролик.колесо"):
+        b.wheel(page, -20, 10)
+        b.wheel(page, 20, 10)
+    with b.step("ролик.окно-тащить"):
+        b.drag(title_spot(sc, win), 250, 80, 1.0)
+    if os.environ.get("DESKBENCH_YOUTUBE") == "1":
+        web_go(b, HEAVY_YOUTUBE, settle=6.0)
+        tube = (x + w * 0.33, y + h * 0.40)
+        if not sound_playing():
+            b.click(tube, wait=3.0)
+        if not sound_playing():
+            b.note("YouTube не заиграл")
+        b.to((x + w * 0.9, y + h * 0.9))
+        with b.step("ютуб.играет"):
+            b.send("wait 8")
+        b.to(page)
+        with b.step("ютуб.курсор"):
+            b.circle(3)
+        with b.step("ютуб.колесо"):
+            b.wheel(page, -20, 10)
+            b.wheel(page, 20, 10)
+
+
+# Кабель «вынуть» и «вставить» программно: гаджет USB телефона отключается от приставки и подключается снова
+# (docs/PI.md, «Кабель и Wi-Fi без шва»); команды идут телефону по Wi-Fi
+UNPLUG = "sudo -n sh -c \"echo '' > /sys/kernel/config/usb_gadget/g1/UDC\""
+PLUG = "sudo -n naomi-usb bind"
+
+
+def later(sec, cmd):
+    t = threading.Timer(sec, lambda: phone(cmd, check=False))
+    t.start()
+    return t
+
+
+def s_cable(b):
+    """Переход кабель ↔ Wi-Fi без шва (этап 5 разбора, docs/AUDIT.md): окно «Файлов» тащат, а кабель в это время
+    вынимают и вставляют; то же в покое, когда радио телефона спит. В конце кабель подключён всегда."""
+    ensure_closed(b, "FilesWindow")
+    sc = b.look()
+    b.click(sc.one(id="fileItem"), wait=1.0)
+    sc = b.look()
+    spot = title_spot(sc, window(sc, "FilesWindow"))
+    n = sc.one(id="nItem")
+    try:
+        with b.step("кабель.вынут-на-ходу"):
+            t = later(2.5, UNPLUG)
+            b.drag(spot, 300, 100, 3.5)
+            t.join()
+        with b.step("wifi.тащить"):
+            b.drag(spot, 300, 100, 2.0)
+        with b.step("wifi.меню-N"):
+            for _ in range(3):
+                b.click(n, wait=0.5)
+                b.click(n, wait=0.5)
+        with b.step("кабель.вставлен-на-ходу"):
+            t = later(1.0, PLUG)
+            b.drag(spot, 300, 100, 5.0)
+            t.join()
+        b.send("wait 3")
+        with b.step("кабель.тащить-после"):
+            b.drag(spot, 300, 100, 2.0)
+        if os.environ.get("DESKBENCH_NOREST") == "1":   # для сравнения: покоя нет — мышь шевелится, радио не спит
+            for _ in range(28):
+                b.send("rel 1 0 0.05 rel -1 0 0.05 wait 0.4")
+        else:
+            b.send("wait 14")   # покой: радио телефона уснуло (10 с без движения), запасной путь — на редком пинге
+        with b.step("кабель.вынут-в-покое"):
+            t = later(0.3, UNPLUG)
+            b.send("wait 2.0")
+            t.join()
+            b.click(n, wait=0.6)
+            b.click(n, wait=0.6)
+        with b.step("wifi.тащить-после-покоя"):
+            b.drag(spot, 300, 100, 2.0)
+    finally:
+        phone(PLUG, check=False)
+        b.send("wait 7")
+    sc = b.look()
+    b.click(win_button(sc, window(sc, "FilesWindow"), "close"), wait=0.6)
+
+
+# Интернет по кабелю (docs/PI.md, «Интернет по кабелю»): в браузере стола играет настоящий YouTube, кабель вынимают и
+# вставляют. Стол должен перейти на Wi-Fi без шва, ролик — играть дальше (видно по кадрам браузера в таблице шагов:
+# играет — десятки в секунду); в отчёт — сколько принято по кабелю и по Wi-Fi на каждом отрезке: ролик качается туда,
+# куда смотрит маршрут в интернет. Щелчок по плееру — всегда: поток звука браузера числится играющим и на паузе
+def net_bytes():
+    # кабель «вынут» программно — интерфейса usb0 нет вовсе (0), «вставлен» — он новый, счёт с нуля (см. part)
+    out = phone("for i in usb0 wlan0; do cat /sys/class/net/$i/statistics/rx_bytes 2>/dev/null || echo 0; done").split()
+    return int(out[0]), int(out[1])
+
+
+def s_net_cable(b):
+    sc = b.look()
+    win = web_window(sc)
+    if not win:
+        b.click(sc.one(id="webItem"), wait=3.0)
+        sc = b.look()
+        win = web_window(sc)
+    if not win:
+        b.note("интернет по кабелю: браузер не открылся")
+        return
+    x, y, w, h = win["r"]
+    mine = web_go(b, HEAVY_YOUTUBE, settle=6.0, new=True)   # своя вкладка, в конце закрывается
+    parts = []
+
+    def part(name, action=None, sec=20):
+        a = net_bytes()
+        with b.step(name):
+            t = later(1.0, action) if action else None
+            b.send(f"wait {sec}")
+            if t:
+                t.join()
+        z = net_bytes()
+        d = [(z[k] - a[k] if z[k] >= a[k] else z[k]) / 1e6 for k in (0, 1)]
+        parts.append((name, d[0], d[1]))
+
+    try:
+        b.click((x + w * 0.33, y + h * 0.40), wait=3.0)   # плеер: пуск
+        b.to((x + w * 0.9, y + h * 0.9))   # курсор прочь с плеера
+        part("интернет.кабель")
+        part("интернет.вынут", UNPLUG)
+        part("интернет.wifi")
+        part("интернет.вставлен", PLUG)
+        part("интернет.снова-кабель")
+    finally:
+        phone(PLUG, check=False)
+        if mine is not None:
+            web_cmd({"type": "close", "id": mine})
+            b.send("wait 0.5")
+    for name, cable, wifi in parts:
+        b.note(f"{name}: принято по кабелю {cable:.1f} МБ, по Wi-Fi {wifi:.1f} МБ")
+
+
+LOOP_PAGE = "/home/phablet/naomi/test-media/loop.html"
+# Ролик по кругу: без звука (такой ролик движок пускает сам, без щелчка), без кнопок (щелчок сценария не поставит на
+# паузу) и с присмотром — встал, запустить снова
+LOOP_HTML = ("<!doctype html><meta charset=utf-8><title>loop</title><style>html,body{margin:0;background:#000;height:100%}"
+             "video{width:100%;height:100%}</style><video id=v src=\"h264-1080p60.mp4\" loop muted autoplay playsinline>"
+             "</video><script>const v=document.getElementById('v');const go=()=>{if(v.paused)v.play().catch(()=>{})};"
+             "go();setInterval(go,1000)</script>\n")
+
+
+def stream_fps():
+    """сколько кадров в секунду сейчас шлёт трансляция (строки журнала оболочки за последние 3 с; нет строк — 0)"""
+    out = phone("journalctl -u naomi-shell --since '-3 s' --no-pager -o cat | grep -o 'naomi.stream: кадров [0-9]*' "
+                "| tail -2; true", check=False)
+    n = [int(x.split()[-1]) for x in out.splitlines() if x.strip()]
+    return max(n) if n else 0
+
+
+def s_video_long(b):
+    """Нагрев (этап 6 разбора, docs/AUDIT.md): ролик 1080p60 в окне браузера по кругу, шаг на минуту — в таблице
+    прогона по минутам видны кадры браузера, видеочип, мощность, корпус; в подробностях — ограничители и частоты.
+    Минут — DESKBENCH_SOAK_MIN (10: дольше нагрев не мерим — решение пользователя, docs/DESKTOP.md)."""
+    minutes = int(os.environ.get("DESKBENCH_SOAK_MIN", "10"))
+    phone(f"cat > {LOOP_PAGE}", input=LOOP_HTML)
+    sc = b.look()
+    win = web_window(sc)
+    if not win:
+        b.click(sc.one(id="webItem"), wait=3.0)
+        sc = b.look()
+        win = web_window(sc)
+    if not win:
+        b.note("нагрев: браузер не открылся")
+        return
+    x, y, w, h = win["r"]
+    mine = web_go(b, "file://" + LOOP_PAGE, settle=2.0, new=True)
+    try:
+        b.to((x + w * 0.9, y + h * 0.95))
+        b.send("wait 3")
+        fps = stream_fps()
+        if fps < 40:   # ролик 60 к/с должен идти: иначе это не замер нагрева, а 10 минут покоя
+            b.note(f"нагрев: ролик не идёт (кадров в секунду {fps}) — замер не начат")
+            return
+        print(f"  ролик идёт: {fps} кадров в секунду", flush=True)
+        for m in range(1, minutes + 1):
+            # курсор чуть в сторону раз в минуту: стол без дела сам выходит (docs/DESKTOP.md, «Выход из стола без дела»)
+            b.to((x + w * 0.9 + (m % 2) * 6, y + h * 0.95))
+            with b.step(f"нагрев.мин-{m:02d}"):
+                b.send("wait 58")
+            if stream_fps() < 40:
+                b.note(f"нагрев: на минуте {m} ролик встал — замер прерван")
+                break
+    finally:
+        if mine is not None:
+            web_cmd({"type": "close", "id": mine})
+            b.send("wait 0.5")
+
+
+def s_drag_long(b):
+    """Ровная долгая нагрузка — окно «Файлов» тащат 40 с: для замеров мощности и тепла (кадры стола 75 в секунду)"""
+    ensure_closed(b, "FilesWindow")
+    sc = b.look()
+    b.click(sc.one(id="fileItem"), wait=1.0)
+    sc = b.look()
+    spot = title_spot(sc, window(sc, "FilesWindow"))
+    with b.step("тащить-долго"):
+        b.drag(spot, 500, 200, 20.0)
+    sc = b.look()
+    b.click(win_button(sc, window(sc, "FilesWindow"), "close"), wait=0.6)
+
+
+HISTORY = "~/.local/share/naomi/web/history.sqlite"
+HISTORY_COPY = "~/naomi/scratch/history.deskbench.sqlite"
+
+
+def history(action):
+    """История браузера до и после прогонов web-heavy: адреса сценария — как были (или прочь, если их не было)."""
+    if action == "save":
+        phone(f"mkdir -p ~/naomi/scratch && cp {HISTORY} {HISTORY_COPY}")
+        print("копия истории браузера снята")
+        return
+    if phone("pgrep -x naomi-web >/dev/null && echo run; true").strip() == "run":
+        sys.exit("браузер открыт — историю не трогаю: сначала tools/naomi run")
+    urls = ", ".join(f"'{u}'" for u in (HEAVY_PAGE, HEAVY_LOAD, HEAVY_YOUTUBE))
+    sql = (f"ATTACH '{HISTORY_COPY.replace('~', '/home/phablet')}' AS b; "
+           f"DELETE FROM main.urls WHERE (url IN ({urls}) OR url LIKE 'file:///home/phablet/naomi/test-media/%') "
+           "AND url NOT IN (SELECT url FROM b.urls); "
+           "UPDATE main.urls SET visit_count = (SELECT bb.visit_count FROM b.urls bb WHERE bb.url = main.urls.url), "
+           "last_visit = (SELECT bb.last_visit FROM b.urls bb WHERE bb.url = main.urls.url) "
+           f"WHERE url IN ({urls}) AND url IN (SELECT url FROM b.urls); "
+           "SELECT count(*) FROM main.urls u LEFT JOIN b.urls bb ON bb.url = u.url "
+           "WHERE bb.url IS NULL OR bb.visit_count != u.visit_count;")
+    left = phone(f'test -f {HISTORY_COPY} && sqlite3 {HISTORY} "{sql}"', check=False).strip()
+    print(f"история браузера: адреса сценария возвращены; строк, что отличаются от копии (заходы не сценария): {left or '?'}")
+
+
+def s_web_close(b):
+    sc = b.look()
+    win = web_window(sc)
+    if win:
+        with b.step("браузер.закрыть"):
+            b.click(win_button(sc, win, "close"), wait=1.0)
+
+
+def s_sound(b):
+    sc = b.look()
+    with b.step("звук.окно"):
+        b.click(sc.one(id="sound"), wait=2.5)
+        b.send("key 1 wait 0.6")
+    if b.look().find(t="SoundPopover"):
+        b.click((b.dw * 0.5, b.dh * 0.7), wait=0.5)
+
+
+def s_bluetooth(b):
+    sc = b.look()
+    with b.step("bluetooth.окно"):
+        b.click(sc.one(id="bt"), wait=2.0)
+        b.send("key 1 wait 0.6")
+    if b.look().find(t="BluetoothPopover"):
+        b.click((b.dw * 0.5, b.dh * 0.7), wait=0.5)
+
+
+def s_settings(b):
+    ensure_closed(b, "SettingsWindow")
+    sc = b.look()
+    with b.step("настройки.открыть"):
+        b.click(sc.one(id="nItem"), wait=0.5)
+        sc2 = b.look()
+        b.click(sc2.one(t="IconButton", action="settings"), wait=1.0)
+    sc = b.look()
+    navs = sc.find(t="NavItem")
+    with b.step("настройки.разделы"):
+        for nav in navs[1:] + navs[:1]:
+            b.click(nav, wait=0.7)
+    sc = b.look()
+    win = window(sc, "SettingsWindow")
+    x, y, w, h = win["r"]
+    with b.step("настройки.колесо"):
+        b.wheel((x + w * 0.6, y + h * 0.6), -6, 8)
+        b.wheel((x + w * 0.6, y + h * 0.6), 6, 8)
+    with b.step("настройки.тащить"):
+        b.drag(title_spot(sc, win), -220, 60, 1.0)
+    sc = b.look()
+    with b.step("настройки.закрыть"):
+        b.click(win_button(sc, window(sc, "SettingsWindow"), "close"), wait=0.8)
+
+
+def s_screenshot(b):
+    with b.step("скриншот.весь-стол"):
+        b.key(42, 56, 4, wait=2.5)
+    with b.step("скриншот.область-отмена"):
+        b.key(42, 56, 5, wait=0.8)
+        b.send("key 1 wait 0.6")
+
+
+def s_multi(b):
+    """три окна сразу: щёлкать между ними, тащить одно поверх других"""
+    sc = b.look()
+    if not sc.find(t="FilesWindow"):
+        b.click(sc.one(id="fileItem"), wait=1.0)
+    b.click(sc.one(id="nItem"), wait=0.5)
+    b.click(b.look().one(t="IconButton", action="settings"), wait=1.0)
+    sc = b.look()
+    if not web_window(sc):
+        b.click(sc.one(id="webItem"), wait=3.0)
+    sc = b.look()
+    wins = [w for w in (sc.find(t="FilesWindow") + sc.find(t="SettingsWindow") + sc.find(t="WebWindow"))]
+    with b.step("три-окна.переключать"):
+        for w in wins + wins:
+            x, y, ww, hh = w["r"]
+            b.click((x + 30, y + 20), wait=0.5)
+    sc = b.look()
+    f = window(sc, "FilesWindow")
+    with b.step("три-окна.тащить-поверх"):
+        b.drag(title_spot(sc, f), 350, 150, 1.2)
+    ensure_closed(b, "SettingsWindow")
+    ensure_closed(b, "FilesWindow")
+
+
+# --- Android (Waydroid, docs/ANDROID.md) ----------------------------------------------------------------------------
+# Приложение открывает та же команда, что и щелчок по строке «03 ANDROID» (waydroid app launch), окно ставит на
+# известное место naomid (как стол после перетаскивания); всё остальное — мышью приставки. Кадры приложения — по
+# трассе стола: кадры, к которым окно Android прислало новую картинку (строки d, AndroidSurface).
+LXC = ("sudo -n lxc-attach -P /var/lib/waydroid/lxc -n waydroid --clear-env -v PATH=/system/bin:/system/xbin:/vendor/bin "
+       "-- /system/bin/sh -s")
+A_SETTINGS, A_CALC, A_GAME = "com.android.settings", "com.android.calculator2", "com.kiloo.subwaysurf"
+A_CALL = "busctl --system call org.naomi.Phone /org/naomi/Phone/Android org.naomi.Phone.Android "
+
+
+def ash(script):
+    """команды внутри Android (от root в контейнере)"""
+    return phone(LXC, check=False, input=script)
+
+
+def a_wins(sc):
+    """окна Android на столе: пакет → {win, frame, caption, buttons}; элементы окна идут в сцене следом за ним"""
+    out, cur = {}, None
+    for i in sc.items:
+        if i["t"] == "AndroidWindow":
+            cur = {"win": i, "buttons": {}} if i.get("p", {}).get("shown") else None
+            if cur:
+                out[i["p"].get("pkg", "")] = cur
+        elif i["t"] in ("FilesWindow", "WebWindow", "SettingsWindow", "DeskBar"):
+            cur = None
+        elif cur is not None:
+            if i.get("id") == "caption":
+                cur["caption"] = i["r"]
+            elif i.get("id") == "frameBox":
+                cur["frame"] = i["r"]
+            elif i["t"] == "WinButton" and i.get("in") == "caption":
+                cur["buttons"][i.get("p", {}).get("glyph")] = i
+    for v in out.values():   # развёрнутое окно — без краёв для растягивания (frameBox): рамка — от полосы до низа стола
+        if "frame" not in v and "caption" in v:
+            x, y, w, h = v["caption"]
+            v["frame"] = [x, y, w, sc.h - y]
+    return {k: v for k, v in out.items() if "frame" in v}
+
+
+def a_tasks():
+    out = phone("busctl --system get-property org.naomi.Phone /org/naomi/Phone/Android org.naomi.Phone.Android Tasks; true")
+    try:
+        return json.loads(json.loads(out.split(" ", 1)[1]))
+    except Exception:
+        return []
+
+
+def a_open(b, pkg, timeout=60, settle=1.5):
+    """открыть приложение и дождаться картинки его окна (журнал оболочки); ответ — секунд до картинки или None"""
+    if pkg in a_wins(b.look()):
+        return None
+    t0 = float(phone(f"python3 -c 'import time; print(time.monotonic())'; waydroid app launch {pkg} >/dev/null 2>&1 &").strip())
+    return a_picture(b, pkg, t0, timeout, settle)
+
+
+def a_picture(b, pkg, t0, timeout=60, settle=1.5):
+    """дождаться картинки окна приложения, запущенного в t0 (часы телефона); ответ — секунд до картинки или None"""
+    took = None
+    end = time.time() + timeout
+    while time.time() < end and took is None:
+        b.send("wait 0.4")
+        log = phone("journalctl -u naomi-shell --since '-70 s' --no-pager -o short-monotonic | "
+                    f"grep 'окно Android {pkg}: картинка'; true")
+        for line in log.splitlines():
+            t = float(line.split("]")[0].strip("[ "))
+            if t >= t0:
+                took = t - t0
+                break
+    if took is None:
+        b.note(f"Android: {pkg} не открылся за {timeout} с")
+    else:
+        print(f"  {pkg}: окно с картинкой через {took:.2f} с", flush=True)
+    b.send("wait", settle)
+    return took
+
+
+def a_place(b, pkg, x, y, w, h):
+    """задачу Android — в прямоугольник (точки стола; верх — под панелью стола): как стол после растягивания"""
+    k = 2400 / b.dw   # пикселей экрана Android в точке стола
+    hidden = 64
+    for t in a_tasks():
+        if t["pkg"] == pkg and t["mode"] == "freeform":
+            phone(A_CALL + f"ResizeTask siiiiiiii {pkg} {t['x']} {t['y']} {t['w']} {t['h']} "
+                  f"{round(x * k)} {round((y - 40) * k) + hidden} {round(w * k)} {round(h * k)}", check=False)
+            b.send("wait 1.2")
+            return True
+    b.note(f"Android: у {pkg} нет задачи-окна — не поставлено")
+    return False
+
+
+def a_close(b, pkg):
+    """закрыть приложение: Shift + крестик; не вышло (крестик за краем, окно на весь экран) — силой в Android"""
+    w = a_wins(b.look()).get(pkg)
+    if w and "close" in w["buttons"]:
+        b.send("down 42 wait 0.05")
+        b.click(w["buttons"]["close"], wait=0.3)
+        b.send("up 42 wait 1.0")
+    if any(t["pkg"] == pkg for t in a_tasks()) or pkg in a_wins(b.look()):
+        ash(f"am force-stop {pkg}")
+        b.send("wait 1.0")
+
+
+def a_gfx(b, pkg, label, reset=False):
+    """счёт кадров самого приложения (hwui: всего, с опозданием, 50/90/99 %) — в заметки; reset — обнулить"""
+    if reset:
+        ash(f"dumpsys gfxinfo {pkg} reset >/dev/null")
+        return
+    out = ash(f"dumpsys gfxinfo {pkg} | grep -E 'Total frames|Janky frames:|percentile|Missed Vsync|Slow UI|deadline missed:'")
+    b.note(f"{label} — кадры {pkg} по счёту Android: " + "; ".join(l.strip() for l in out.splitlines()[:9]))
+
+
+def shot(b, name):
+    """снимок стола в папку прогона (между шагами: чтение кадра — 20 мс потока интерфейса)"""
+    subprocess.run([os.path.join(ROOT, "tools", "naomi"), "shot", "desk", f"bench-{name}"], capture_output=True)
+    src = os.path.join(ROOT, "reports", "screens", f"bench-{name}.png")
+    if os.path.exists(src):
+        os.replace(src, os.path.join(b.out, f"{name}.png"))
+
+
+def a_frame(b, pkg):
+    w = a_wins(b.look()).get(pkg)
+    if not w:
+        raise LookupError(f"нет окна Android {pkg}")
+    return w
+
+
+def a_title(w):
+    x, y, ww, hh = w["caption"]
+    return (x + ww * 0.4, y + hh / 2)
+
+
+def s_android_app(b):
+    """Обычное приложение Android («Настройки»): открыть холодным, покой, колесо, щелчки по разделам, окно — тащить,
+    тянуть за угол, развернуть, на весь экран, свернуть-вернуть, закрыть"""
+    for pkg in list(a_wins(b.look())):
+        a_close(b, pkg)
+    frozen = phone("sudo -n waydroid status | grep -c FROZEN; true").strip() == "1"
+    b.send("mark", "android.открыть:start")
+    took = a_open(b, A_SETTINGS, settle=0.5)
+    b.send("mark", "android.открыть:end")
+    b.note(f"«Настройки» Android: до картинки {took if took is None else round(took, 2)} с "
+           f"(контейнер был {'заморожен' if frozen else 'на ходу'})")
+    a_place(b, A_SETTINGS, 200, 90, 1300, 800)   # шире 900 точек «Настройки» — в два столбца: слева разделы
+    w = a_frame(b, A_SETTINGS)
+    x, y, ww, hh = w["frame"]
+    lst = (x + ww * 0.18, y + hh * 0.6)
+    shot(b, "android-app")
+    a_gfx(b, A_SETTINGS, "", reset=True)
+    with b.step("android.покой-окно"):
+        b.send("wait 4")
+    with b.step("android.колесо"):
+        b.wheel(lst, -20, 10)
+        b.wheel(lst, 20, 10)
+    with b.step("android.курсор-над"):
+        b.to(lst)
+        b.circle(3)
+    with b.step("android.щелчки"):
+        for k in (0.30, 0.42, 0.54, 0.66, 0.78, 0.30, 0.54, 0.78):
+            b.click((x + ww * 0.18, y + hh * k), wait=0.9)
+    a_gfx(b, A_SETTINGS, "прокрутка и разделы «Настроек»")
+    w = a_frame(b, A_SETTINGS)
+    with b.step("android.тащить"):
+        b.drag(a_title(w), 250, 80, 1.0)
+    b.send("wait 1.0")
+    w = a_frame(b, A_SETTINGS)
+    x, y, ww, hh = w["frame"]
+    with b.step("android.размер-угол"):
+        b.drag((x + ww + 3, y + hh + 3), -160, -90, 1.0)
+    b.send("wait 1.5")
+    w = a_frame(b, A_SETTINGS)
+    with b.step("android.развернуть"):
+        b.dclick(a_title(w), wait=1.5)
+    w = a_frame(b, A_SETTINGS)
+    with b.step("android.вернуть"):
+        b.dclick(a_title(w), wait=1.5)
+    w = a_frame(b, A_SETTINGS)
+    if "panel" in w["buttons"]:
+        with b.step("android.на-весь-экран"):
+            b.click(w["buttons"]["panel"], wait=2.0)
+        sc = b.look()
+        back = [i for i in sc.find(t="BarItem") if i.get("id") in ("windowItem", "panelWindow")]
+        if back:
+            with b.step("android.в-окно"):
+                b.click(back[0], wait=2.0)
+        else:
+            b.note("Android: на панели нет кнопки «в окно»: " + ", ".join(sorted({i.get('id', '') for i in sc.find(t='BarItem')})))
+    w = a_wins(b.look()).get(A_SETTINGS)
+    app = next((i for i in b.sc.find(id="appItem")), None)
+    if w and app:
+        with b.step("android.свернуть-вернуть"):
+            b.click(w["buttons"]["close"], wait=1.0)
+            b.click(app, wait=1.2)
+    with b.step("android.закрыть"):
+        a_close(b, A_SETTINGS)
+
+
+def game_ready(b):
+    if A_GAME not in a_wins(b.look()):
+        a_open(b, A_GAME, settle=1.0)
+        a_place(b, A_GAME, 700, 100, 540, 870)
+        b.send("wait 14")   # заставка и загрузка игры до меню
+    return a_frame(b, A_GAME)
+
+
+def s_android_game(b):
+    """Игра (Subway Surfers, Unity) в окне: покой, стол поверх неё — курсор, меню N, «Файлы» тащат над игрой; окно игры —
+    тащить, развернуть, на весь экран. Игра остаётся открытой (следом — android-multi)"""
+    w = game_ready(b)
+    x, y, ww, hh = w["frame"]
+    b.to((x - 150, y + hh * 0.5))
+    shot(b, "game")
+    with b.step("игра.покой"):
+        b.send("wait 8")
+    with b.step("игра.курсор-рядом"):
+        b.circle(3)
+    b.to((x + ww * 0.5, y + hh * 0.5))
+    with b.step("игра.курсор-над"):
+        b.circle(3)
+    sc = b.look()
+    n = sc.one(id="nItem")
+    with b.step("игра.меню-N"):
+        for _ in range(3):
+            b.click(n, wait=0.5)
+            b.click(n, wait=0.5)
+    ensure_closed(b, "FilesWindow")
+    sc = b.look()
+    with b.step("игра.файлы-открыть"):
+        b.click(sc.one(id="fileItem"), wait=1.0)
+    sc = b.look()
+    f = window(sc, "FilesWindow")
+    with b.step("игра.файлы-тащить"):
+        b.drag(title_spot(sc, f), 300, 100, 1.2)
+    sc = b.look()
+    f = window(sc, "FilesWindow")
+    fx, fy, fw, fh = f["r"]
+    with b.step("игра.файлы-колесо"):
+        b.wheel((fx + fw * 0.6, fy + fh * 0.6), -10, 10)
+        b.wheel((fx + fw * 0.6, fy + fh * 0.6), 10, 10)
+    with b.step("игра.файлы-закрыть"):
+        b.click(win_button(sc, f, "close"), wait=0.8)
+    w = a_frame(b, A_GAME)
+    with b.step("игра.окно-тащить"):
+        b.drag(a_title(w), -250, 60, 1.2)
+    b.send("wait 1.5")
+    w = a_frame(b, A_GAME)
+    with b.step("игра.развернуть"):
+        b.dclick(a_title(w), wait=2.5)
+    shot(b, "game-max")
+    with b.step("игра.развёрнута-покой"):
+        b.send("wait 6")
+    w = a_frame(b, A_GAME)
+    with b.step("игра.вернуть"):
+        b.dclick(a_title(w), wait=2.5)
+
+
+def s_android_multi(b):
+    """Всё сразу: игра, «Настройки» и «Калькулятор» Android, ролик 1080p60 в браузере, «Файлы» — переключать, тащить,
+    листать; в конце приложения Android закрыты, вкладка ролика тоже"""
+    w = game_ready(b)
+    a_open(b, A_SETTINGS)
+    a_place(b, A_SETTINGS, 60, 90, 620, 640)
+    a_open(b, A_CALC)
+    a_place(b, A_CALC, 1300, 420, 400, 520)
+    wins = a_wins(b.look())
+    shot(b, "multi-android")
+    with b.step("много.три-android-покой"):
+        b.send("wait 6")
+    with b.step("много.переключать"):
+        for _ in range(2):
+            for pkg in (A_SETTINGS, A_CALC, A_GAME):
+                if pkg in wins:
+                    fx, fy, fw, fh = wins[pkg]["frame"]
+                    b.click((fx + fw * 0.5, fy + 20), wait=0.6)
+    w = a_frame(b, A_SETTINGS)
+    with b.step("много.настройки-тащить-над-игрой"):
+        b.drag(a_title(w), 420, 60, 1.5)
+    b.send("wait 1.5")
+    w = a_frame(b, A_SETTINGS)
+    x, y, ww, hh = w["frame"]
+    with b.step("много.настройки-колесо"):
+        b.wheel((x + ww * 0.5, y + hh * 0.6), -20, 10)
+        b.wheel((x + ww * 0.5, y + hh * 0.6), 20, 10)
+    # ролик в браузере — как в шаге «нагрев»: без звука, по кругу
+    phone(f"cat > {LOOP_PAGE}", input=LOOP_HTML)
+    sc = b.look()
+    if not web_window(sc):
+        b.click(sc.one(id="webItem"), wait=3.0)
+    mine = web_go(b, "file://" + LOOP_PAGE, settle=3.0, new=True)
+    try:
+        b.note(f"много: ролик в браузере — кадров трансляции в секунду {stream_fps()}")
+        b.to((b.dw * 0.5, b.dh * 0.97))
+        shot(b, "multi-all")
+        with b.step("много.ролик+игра-покой"):
+            b.send("wait 8")
+        sc = b.look()
+        n = sc.one(id="nItem")
+        with b.step("много.меню-N"):
+            for _ in range(3):
+                b.click(n, wait=0.5)
+                b.click(n, wait=0.5)
+        with b.step("много.файлы-открыть"):
+            b.click(sc.one(id="fileItem"), wait=1.0)
+        sc = b.look()
+        f = window(sc, "FilesWindow")
+        with b.step("много.файлы-тащить"):
+            b.drag(title_spot(sc, f), 300, 100, 1.5)
+        w = a_wins(b.look()).get(A_GAME)
+        if w:
+            fx, fy, fw, fh = w["frame"]
+            b.click((fx + fw * 0.5, fy + 20), wait=0.6)
+            w = a_frame(b, A_GAME)
+            with b.step("много.игра-тащить"):
+                b.drag(a_title(w), 200, 60, 1.5)
+        mem = phone("grep -E 'MemAvailable|MemFree' /proc/meminfo | tr -s ' ' | tr '\\n' ' '; cat /proc/pressure/memory | head -1")
+        b.note("много: память на пике — " + mem.strip())
+    finally:
+        if mine is not None:
+            web_cmd({"type": "close", "id": mine})
+            b.send("wait 0.5")
+        ensure_closed(b, "FilesWindow")
+    for pkg in (A_CALC, A_SETTINGS, A_GAME):
+        a_close(b, pkg)
+
+
+def stream_gpu(sec=4):
+    """цена кадра стола на видеочипе, мс (строки журнала оболочки за последние sec секунд): (всего, кадр, упаковка) —
+    медианы по строкам, где шло не меньше 60 кадров в секунду; частей может не быть (None)"""
+    out = phone(f"journalctl -u naomi-shell --since '-{sec} s' --no-pager -o cat | grep 'naomi.stream: кадров'; true",
+                check=False)
+    rows = []
+    for l in out.splitlines():
+        try:
+            if int(l.split("кадров ")[1].split(",")[0]) < 60:
+                continue
+            g = l.split("видеочип ")[1]
+            total = float(g.split(":")[0].split(";")[0].split(")")[0].split(",")[0])
+            parts = (float(g.split("кадр ")[1].split(",")[0]), float(g.split("упаковка ")[1].split(";")[0])) \
+                if "упаковка" in g else (None, None)
+            rows.append((total,) + parts)
+        except (IndexError, ValueError):
+            pass
+    if not rows:
+        return None
+    med = lambda i: statistics.median(r[i] for r in rows) if rows[0][i] is not None else None
+    return med(0), med(1), med(2)
+
+
+def s_android_windows(b):
+    """Цена кадра оболочки на видеочипе от числа окон Android: игра (рисует 75 кадров в секунду) одна, потом рядом
+    «Настройки», потом ещё «Калькулятор» — по 6 с покоя; в заметках — мс видеочипа на кадр стола (журнал трансляции)"""
+    for pkg in (A_SETTINGS, A_CALC):
+        if pkg in a_wins(b.look()):
+            a_close(b, pkg)
+    game_ready(b)
+    a_place(b, A_GAME, 700, 100, 540, 870)   # игра могла остаться развёрнутой — в окно, как всегда
+    b.to((b.dw * 0.5, b.dh * 0.985))
+    note = []
+    for name, pkg, place in (("одно", None, None), ("два", A_SETTINGS, (60, 90, 620, 640)),
+                             ("три", A_CALC, (1300, 420, 400, 520))):
+        if pkg:
+            a_open(b, pkg)
+            a_place(b, pkg, *place)
+            b.to((b.dw * 0.5, b.dh * 0.985))
+        with b.step(f"окна-android.{name}"):
+            b.send("wait 6")
+        g = stream_gpu()
+        if g:
+            note.append(f"{name} — {g[0]:.1f}" + (f" (кадр {g[1]:.1f}, упаковка {g[2]:.1f})" if g[1] is not None else ""))
+    b.note("видеочип на кадр стола, мс, окон Android: " + "; ".join(note))
+    for pkg in (A_CALC, A_SETTINGS):
+        a_close(b, pkg)
+    # игра развёрнута: занятость видеочипа по счётчику ядра (gpubusy: занят / всего, мкс) и вытеснения заданий
+    gpu = "cat /sys/class/kgsl/kgsl-3d0/gpubusy /sys/class/kgsl/kgsl-3d0/preempt_count"
+    w = a_frame(b, A_GAME)
+    b.dclick(a_title(w), wait=3.0)
+    b.to((b.dw * 0.5, b.dh * 0.985))
+    before = []
+    for _ in range(3):   # счётчик gpubusy обнуляется чтением — берём сумму нескольких чтений за шаг
+        phone(gpu)
+        with b.step("окна-android.игра-развёрнута"):
+            b.send("wait 4")
+        f = phone(gpu).split()
+        before.append((int(f[0]), int(f[1]), int(f[2], 16)))
+    p0 = int(phone(gpu).split()[2], 16)
+    b.send("wait 4")
+    p1 = int(phone(gpu).split()[2], 16)
+    busy = [100 * x / max(1, y) for x, y, _ in before]
+    g = stream_gpu()
+    b.note("игра развёрнута: видеочип занят (gpubusy) " + " / ".join(f"{v:.0f} %" for v in busy)
+           + f"; вытеснений заданий за 4 с — {p1 - p0}" + (f"; кадр стола на видеочипе {g[0]:.1f} мс" if g else ""))
+    w = a_frame(b, A_GAME)
+    b.dclick(a_title(w), wait=2.5)
+
+
+def cool_down(limit=31.0, timeout=360):
+    """ждать, пока корпус телефона остынет: прогоны подряд греют, нагретый режет частоту ядер — сравнивать нельзя"""
+    cmd = ("for z in /sys/class/thermal/thermal_zone*; do [ \"$(cat $z/type)\" = skin-therm ] && cat $z/temp; done; true")
+    end = time.time() + timeout
+    while True:
+        t = int(phone(cmd).split()[0]) / 1000
+        if t <= limit or time.time() > end:
+            print(f"  корпус {t:.1f} °C", flush=True)
+            return t
+        time.sleep(15)
+
+
+def s_android_cold(b):
+    """Самое тяжёлое для стола: Android включают с нуля и сразу запускают игру — пока она грузится (диск, память, Google
+    Play), окно «Файлов» тащат 40 с. Перед этим телефон остывает до 31 °C. Android в начале шага выключается"""
+    phone("timeout -s KILL 40 waydroid session stop; true")
+    ensure_closed(b, "FilesWindow")
+    cool_down()
+    b.send("wait 0.2")   # стол мог уйти «без дела» — движение мыши будит
+    sc = b.look()
+    if not sc.find(t="NMenu"):
+        b.click(sc.one(id="nItem"), wait=1.0)
+        sc = b.look()
+    if not sc.find(id="androidModule"):
+        b.click(next(i for i in sc.items if i["t"] == "Text" and i.get("p", {}).get("text") == "ANDROID"), wait=1.0)
+        sc = b.look()
+    # шестерёнка модуля «03 ANDROID» включает Android и открывает его «Настройки»
+    gear = next(i for i in sc.items if i["t"] == "IconButton" and i.get("in") == "androidModule"
+                and i.get("p", {}).get("glyph") == "gear")
+    t0 = float(phone("python3 -c 'import time; print(time.monotonic())'").strip())
+    b.click(gear, wait=1.0)
+    if a_picture(b, A_SETTINGS, t0, timeout=90, settle=3.0) is None:
+        return
+    phone(f"(waydroid app launch {A_GAME} >/dev/null 2>&1 &); true")
+    sc = b.look()
+    b.click(sc.one(id="fileItem"), wait=1.0)
+    sc = b.look()
+    spot = title_spot(sc, window(sc, "FilesWindow"))
+    with b.step("холодный.игра-грузится"):
+        b.drag(spot, 500, 200, 20.0)
+    sc = b.look()
+    b.click(win_button(sc, window(sc, "FilesWindow"), "close"), wait=0.6)
+
+
+def s_android_phone(b):
+    """Экран телефона и игра на столе сразу: палец (виртуальный, 90 Гц) водит по экрану телефона, игра идёт в окне,
+    курсор стола кружит — держат ли оба свои кадры (кадры экрана телефона — строки naomi-frames журнала оболочки)"""
+    w = game_ready(b)
+    x, y, ww, hh = w["frame"]
+    b.to((x - 150, y + hh * 0.5))
+    phone("sudo -n python3 ~/naomi/bin/touchinject.py key 116; true", check=False)   # экран телефона — разбудить
+    b.send("wait 2")
+    finger = subprocess.Popen(NAOMI.ssh_argv("sudo -n python3 ~/naomi/bin/touchinject.py circle 16"),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    b.send("wait 2.5")
+    with b.step("телефон+игра.палец-и-курсор"):
+        b.circle(5)
+    with b.step("телефон+игра.палец-и-окно"):
+        b.drag(a_title(w), -200, 50, 2.0)
+    finger.wait()
+    with b.step("телефон+игра.без-пальца"):
+        b.circle(5)
+    phone("sudo -n python3 ~/naomi/bin/touchinject.py key 116; true", check=False)   # экран телефона — погасить
+
+
+STEPS = {
+    "android-app": s_android_app, "android-game": s_android_game, "android-multi": s_android_multi,
+    "android-phone": s_android_phone, "android-windows": s_android_windows, "android-cold": s_android_cold,
+    "idle": s_idle, "cursor": s_cursor, "panel": s_panel, "nmenu": s_nmenu, "files": s_files,
+    "files-cycle": s_files_cycle, "web": s_web, "sound": s_sound, "bluetooth": s_bluetooth,
+    "settings": s_settings, "screenshot": s_screenshot, "multi": s_multi, "web-close": s_web_close,
+    "video-load": s_video_load, "web-heavy": s_web_heavy, "cable": s_cable, "net-cable": s_net_cable, "drag-long": s_drag_long, "video-long": s_video_long,
+}
+ORDER = ["idle", "cursor", "panel", "nmenu", "files", "files-cycle", "settings", "sound", "bluetooth", "screenshot",
+         "web", "multi", "video-load", "web-close", "idle"]
+
+
+def run(names):
+    out = os.path.join(ROOT, "reports", f"deskbench-{time.strftime('%Y%m%d-%H%M%S')}")
+    os.makedirs(out)
+    print(f"прогон → {os.path.relpath(out, ROOT)}", flush=True)
+    # телефон: папка, сборщик, трасса стола, звук браузера — тихо
+    # сторож тишины прошлого прогона, если тот оборвался (20 ноября 2026 такой с утра глушил каждый новый звук
+    # телефона): прочь. «[/]» — чтобы образец не совпал с этой же командой
+    phone(f"pkill -f '[/]tmp/deskbench/muted' 2>/dev/null; rm -rf {PHONE_DIR}; mkdir -p {PHONE_DIR}")
+    phone(f"cat > {PHONE_DIR}/desksampler.py", input=open(os.path.join(ROOT, "device", "desksampler.py")).read())
+    shots_before = set(phone("ls ~/Screenshots 2>/dev/null; true").split("\n"))
+    xray = os.environ.get("DESKBENCH_XRAY") == "1"
+    phone(f"sudo -n setsid nohup nice -n 5 python3 {PHONE_DIR}/desksampler.py {PHONE_DIR}/sys.jsonl {PHONE_DIR}/stop 3600 "
+          f"{'light' if xray else ''} > {PHONE_DIR}/sampler.log 2>&1 < /dev/null & true")
+    since = phone("date '+%Y-%m-%d %H:%M:%S'").strip()
+    # звук: потоки PulseAudio, что играют без «тихо», — тихо на время прогона (список — чтобы вернуть ровно их)
+    # не опросом, а по событию «новый поток» (pactl subscribe): опрос раз в 0,5 с сам будил PulseAudio и шину
+    # в список — номер потока и имя программы: поток закроют до конца прогона — «без звука» PulseAudio запомнит за
+    # программой (module-stream-restore), и её следующий звук начнётся тихим; вернуть — по имени (см. конец прогона)
+    quiet = ("pactl list sink-inputs 2>/dev/null | awk '/^Sink Input #/{if(id!=\"\"&&m)print id,app; "
+             "id=substr($3,2); m=0; app=\"-\"} /Mute: no/{m=1} /application.name = /{app=$0; sub(/.*= \"/,\"\",app); "
+             "sub(/\".*/,\"\",app); gsub(/ /,\"_\",app)} END{if(id!=\"\"&&m)print id,app}' | "
+             f"while read i a; do pactl set-sink-input-mute $i 1 && echo $i $a >> {PHONE_DIR}/muted; done")
+    mute = subprocess.Popen(NAOMI.ssh_argv(
+        f"export XDG_RUNTIME_DIR=/run/user/32011; {quiet}; "
+        f"(pactl subscribe & echo $! > {PHONE_DIR}/mute.pid; wait) | grep --line-buffered \"'new' on sink-input\" | "
+        f"while read l; do {quiet}; done"),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) if os.environ.get("DESKBENCH_SOUND") != "1" else None
+    if phone(BUS + PROBE + f"Trace {PHONE_DIR}/desk.csv true").strip() != "(true,)":
+        sys.exit("зонд стола не включил трассу — оболочка без desk_probe? (tools/naomi build && run)")
+    sampling = os.environ.get("DESKBENCH_SAMPLE", "0" if xray else "1") == "1"   # выборки стека потока интерфейса (1 мс)
+    if sampling:
+        phone(BUS + PROBE + f"Sample {PHONE_DIR}/stacks.txt >/dev/null; true")
+    if xray:
+        phone(f"cat > {PHONE_DIR}/xray.py", input=open(os.path.join(ROOT, "device", "xray.py")).read())
+        phone(f"sudo -n setsid nohup python3 {PHONE_DIR}/xray.py 900 {PHONE_DIR}/xray stop={PHONE_DIR}/stop "
+              f"> {PHONE_DIR}/xray.log 2>&1 < /dev/null & true")
+    # приставка: свой приёмник с трассами, проверочная мышь построчно
+    pi(f"rm -rf {PI_DIR}; mkdir -p {PI_DIR}; sudo systemctl stop naomi-dock; "
+       f"sudo env NAOMI_DOCK_TRACE={PI_DIR}/trace.csv NAOMI_DOCK_PTRACE={PI_DIR}/pointer.csv "
+       f"{os.environ.get('PI_ENV', '')} nohup {PI.BIN} > {PI_DIR}/dock.log 2>&1 < /dev/null & sleep 4")
+    b = Bench(out)
+    b.vin = subprocess.Popen(PI.SSH + [f"naomi@{PI.HOST}",
+                                       f"sudo python3 {VINPUT} --hz {MOUSE_HZ} --log {PI_DIR}/input.csv --stdin"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    failed = None
+    try:
+        b.send("wait 2.5")
+        # стол «без дока» (часы на обоях, сцена пустая) — будит клавиша (Shift); ждём, пока вернутся панель и окна
+        for _ in range(10):
+            if b.look().find(id="nItem"):
+                break
+            b.send("key 42 wait 1.0")
+        else:
+            raise RuntimeError("стол не проснулся: в сцене нет панели")
+        for name in names:
+            print(f"{name}", flush=True)
+            try:
+                STEPS[name](b)
+            except (LookupError, RuntimeError) as e:
+                b.note(f"{name}: {e}")
+                if isinstance(e, RuntimeError):
+                    raise
+    except BaseException as e:
+        failed = e
+    finally:
+        try:
+            b.vin.stdin.write("\n")
+            b.vin.stdin.flush()
+            b.vin.wait(timeout=10)
+        except Exception:
+            b.vin.kill()
+        pi(f"sudo pkill -INT -x naomi-dock; sleep 1; sudo chmod a+r {PI_DIR}/*; sudo systemctl start naomi-dock", check=False)
+        phone(BUS + PROBE + "Trace '' false >/dev/null; touch " + PHONE_DIR + "/stop", check=False)
+        if sampling:
+            phone(BUS + PROBE + "Sample '' >/dev/null; true", check=False)
+        time.sleep(1.5)
+        if mute:
+            mute.terminate()
+            # потоки, что ещё играют, — звук им; закрытые — программе: пробный поток тишины с её именем, звук ему,
+            # PulseAudio запомнит «со звуком»
+            phone(f"kill $(cat {PHONE_DIR}/mute.pid) 2>/dev/null; export XDG_RUNTIME_DIR=/run/user/32011; "
+                  f"sort -u {PHONE_DIR}/muted 2>/dev/null | while read i a; do "
+                  "pactl set-sink-input-mute $i 0 2>/dev/null || echo $a; done | sort -u | grep -v '^-$' | "
+                  "while read a; do (timeout 2 pacat --client-name=$a --property=application.name=$a --raw "
+                  "--format=s16le --rate=48000 --channels=2 < /dev/zero &); sleep 0.8; "
+                  "pactl list sink-inputs | awk -v a=$a '/^Sink Input #/{id=substr($3,2)} /application.name = /"
+                  "{x=$0; sub(/.*= \"/,\"\",x); sub(/\".*/,\"\",x); if(x==a)print id}' | "
+                  "while read n; do pactl set-sink-input-mute $n 0; done; done; true", check=False)
+        # свои скриншоты — прочь (чужие не трогать)
+        new = [s for s in phone("ls ~/Screenshots 2>/dev/null; true").split("\n") if s and s not in shots_before]
+        if new:
+            phone("cd ~/Screenshots && rm -f -- " + " ".join(f"'{s}'" for s in new), check=False)
+        subprocess.run(["scp", "-q", *PI.SSH[1:], f"naomi@{PI.HOST}:{PI_DIR}/*", out])
+        for f in ("desk.csv", "sys.jsonl", "stacks.txt"):
+            open(os.path.join(out, f), "w").write(phone(f"cat {PHONE_DIR}/{f}", check=False))
+        open(os.path.join(out, "shell.log"), "w").write(
+            phone(f"journalctl -u naomi-shell --since '{since}' --no-pager -o short-monotonic", check=False))
+        open(os.path.join(out, "notes.txt"), "w").write("\n".join(b.notes) + "\n")
+        if xray:   # трасса ядра: дождаться, пока рентген допишет (сжатие — секунды), и забрать
+            xdir = os.path.join(out, "xray")
+            os.makedirs(xdir)
+            for _ in range(90):
+                if phone(f"pgrep -f '[x]ray.py' >/dev/null && echo busy; true").strip() != "busy":
+                    break
+                time.sleep(1)
+            tar = subprocess.Popen(NAOMI.ssh_argv(f"tar -C {PHONE_DIR}/xray -cf - ."), stdout=subprocess.PIPE)
+            subprocess.run(["tar", "-C", xdir, "-xf", "-"], stdin=tar.stdout)
+            tar.wait()
+            phone(f"sudo -n rm -rf {PHONE_DIR}/xray", check=False)
+    if failed:
+        print(f"прогон прерван: {failed!r}", flush=True)
+        if not isinstance(failed, Exception):
+            raise failed
+    report = analyze(out)
+    print(report)
+    if xray and os.path.exists(os.path.join(out, "xray", "trace.gz")):
+        xray_steps(out)
+
+
+def xray_steps(out):
+    """Рентген по шагам: шаги прогона (часы Pi) → часы телефона → отчёт tools/xray на каждый шаг."""
+    X = load("xray")
+    R = load_run(out)
+    xdir = os.path.join(out, "xray")
+    steps = [{"name": n, "t0": (a + offset_at(R, a)) / 1e6, "t1": (b + offset_at(R, b)) / 1e6} for n, a, b in R["steps"]]
+    json.dump(steps, open(os.path.join(xdir, "steps.json"), "w"), ensure_ascii=False, indent=1)
+    X.report(X.Trace(xdir))
+    for s in steps:
+        text = X.report(X.Trace(xdir, window=(s["t0"], s["t1"]), title=s["name"]))
+        if "НЕ ВЕРИТЬ" in text:   # буфер трассы переполнился до конца шага — см. tools/xray, «ВНИМАНИЕ»
+            print(f"РЕНТГЕН ШАГА «{s['name']}» НЕВЕРЕН: буфер трассы переполнился до конца шага — шаг короче или отдельно")
+    print(f"рентген: {os.path.relpath(xdir, ROOT)}/report.txt и report-ШАГ.txt (tools/xray step {os.path.relpath(xdir, ROOT)} ШАГ)")
+
+
+# --- разбор ---------------------------------------------------------------------------------------------------------
+
+def pct(v, q):
+    v = sorted(v)
+    return v[min(len(v) - 1, int(q * (len(v) - 1) + 0.5))] if v else float("nan")
+
+
+def load_run(folder):
+    R = {}
+    R["input"] = list(csv.DictReader(open(os.path.join(folder, "input.csv"))))
+    R["trace"] = [{k: int(v) for k, v in r.items() if v != ""} for r in csv.DictReader(open(os.path.join(folder, "trace.csv")))]
+    R["ptr"] = [r for r in csv.DictReader(open(os.path.join(folder, "pointer.csv"))) if r["kind"] == "s"]
+    desk = {"t": [], "q": [], "r": [], "e": [], "d": [], "s": []}
+    for line in open(os.path.join(folder, "desk.csv"), errors="replace"):
+        f = line.rstrip("\n").split(",", 5)
+        k = f[0]
+        if k == "t" or k == "q":
+            desk[k].append((int(f[1]), int(f[2])))
+        elif k == "r":
+            desk["r"].append((int(f[1]), int(f[2]), int(f[3]), int(f[4]), int(f[5])))
+        elif k == "e":
+            desk["e"].append(int(f[1]))
+        elif k == "d":
+            desk["d"].append((int(f[1]), line.split(",", 2)[2].strip()))
+        elif k == "s":   # долгое событие потока интерфейса: начало, длилось, на ядре, глубина, в очереди, ядро, тип, кто
+            g = line.rstrip("\n").split(",", 8)
+            if len(g) > 6 and not g[5].lstrip("-").isdigit():   # записи до 19.11.2026 13:30 — без очереди и ядра
+                g = line.rstrip("\n").split(",", 6)
+                g = g[:5] + ["-1", "-1"] + g[5:]
+            desk["s"].append((int(g[1]), int(g[2]), int(g[3]), int(g[4]), g[7], g[8] if len(g) > 8 else "",
+                              int(g[5]), int(g[6])))
+    R["desk"] = desk
+    R["sys"] = [json.loads(l) for l in open(os.path.join(folder, "sys.jsonl")) if l.strip()]
+    R["stacks"] = []
+    if os.path.exists(os.path.join(folder, "stacks.txt")):
+        for l in open(os.path.join(folder, "stacks.txt"), errors="replace"):
+            f = l.rstrip("\n").split(";")
+            if len(f) > 1 and f[0].isdigit():
+                R["stacks"].append((int(f[0]), f[1:]))
+    R["stack_t"] = [t for t, _ in R["stacks"]]
+    hz = 75.0
+    for line in open(os.path.join(folder, "dock.log"), errors="replace"):
+        if line.startswith("экран:") and "Гц" in line:
+            try:
+                hz = float(line.split(",")[-1].split()[0])
+            except ValueError:
+                pass
+    R["P"] = 1e6 / hz
+    R["hz"] = hz
+    # сдвиг часов телефон−Pi плывёт (кварцы: ~10 мс за несколько минут) — по каждой строке трассы, а не один на прогон
+    offs = sorted((r["recv"], r["offset"]) for r in R["trace"] if r.get("offset"))
+    R["off"] = statistics.median(o for _, o in offs) if offs else 0
+    R["offs_t"] = [t for t, _ in offs]
+    R["offs_v"] = [o for _, o in offs]
+    # шаги по меткам
+    steps, open_ = [], {}
+    for r in R["input"]:
+        if r["kind"] == "mark":
+            name, _, edge = r["a"].rpartition(":")
+            if edge == "start":
+                open_[name] = int(r["t"])
+            elif name in open_:
+                steps.append((name, open_.pop(name), int(r["t"])))
+    R["steps"] = steps
+    return R
+
+
+def offset_at(R, t):
+    """сдвиг часов телефон−Pi в момент t (часы Pi): ближайшая строка трассы"""
+    if not R["offs_t"]:
+        return R["off"]
+    i = bisect.bisect_left(R["offs_t"], t)
+    i = min(max(i, 0), len(R["offs_t"]) - 1)
+    if i > 0 and abs(R["offs_t"][i - 1] - t) < abs(R["offs_t"][i] - t):
+        i -= 1
+    return R["offs_v"][i]
+
+
+def analyze_span(R, a, b):
+    """a, b — время Pi (мкс). Всё, что было между ними"""
+    P, off = R["P"], offset_at(R, (a + b) // 2)
+    pa, pb = a + off, b + off   # на часах телефона
+    out = {"sec": (b - a) / 1e6}
+    # монитор
+    fr = [r for r in R["trace"] if a <= r["recv"] <= b + 150000 and r["capture"] - off >= a]
+    shown = sorted((r for r in fr if r["shown"]), key=lambda r: r["shown"])
+    out["frames"] = len(fr)
+    out["dropped"] = sum(1 for r in fr if not r["shown"] and not r.get("key"))
+    # опорный кадр в покое (чистовой, 0,1 с после анимации) — то же, что на экране: его опоздание не видно
+    late = [r for r in shown if r.get("target") and r["shown"] - r["target"] > P / 2 and not r.get("key")]
+    out["late"] = len(late)
+    lat = [(r["shown"] - (r["capture"] - off)) / 1000 for r in shown]
+    out["lat50"], out["lat95"] = pct(lat, .5), pct(lat, .95)
+    # телефон: кадры стола
+    rs = [r for r in R["desk"]["r"] if pa <= r[0] <= pb]
+    work = [(r[1] + r[2] + r[3] + r[4]) / 1000 for r in rs]
+    # кадры браузера: кадры стола, к которым страница прислала новую картинку (строка d трассы — #page в WebWindow)
+    pg = [t for t, items in R["desk"]["d"] if pa <= t <= pb and "#page@WebWindow" in items]
+    pgaps = [(y - x) / 1000 for x, y in zip(pg, pg[1:])]
+    out["page"] = len(pg)
+    out["page_fps"] = len(pg) / max(0.001, (b - a) / 1e6)
+    out["page_gap95"] = pct(pgaps, .95) if pgaps else 0
+    out["page_long"] = sum(1 for g in pgaps if g > 2.5 * 16.7)   # разрывы длиннее двух с половиной кадров страницы
+    # кадры Android: кадры стола, к которым окно Android прислало новую картинку (слой — AndroidSurface)
+    ag = [t for t, items in R["desk"]["d"] if pa <= t <= pb and "AndroidSurface" in items]
+    agaps = [(y - x) / 1000 for x, y in zip(ag, ag[1:])]
+    out["app"] = len(ag)
+    out["app_fps"] = len(ag) / max(0.001, (b - a) / 1e6)
+    out["app_gap95"] = pct(agaps, .95) if agaps else 0
+    out["app_long"] = sum(1 for g in agaps if 2.5 * P / 1000 < g < 100)   # пропущено больше такта, но не пауза
+    out["renders"] = len(rs)
+    out["echo"] = sum(1 for e in R["desk"]["e"] if pa <= e <= pb)
+    out["work50"], out["work95"] = pct(work, .5), pct(work, .95)
+    out["workmax"] = max(work) if work else 0
+    out["parts95"] = [pct([r[i] / 1000 for r in rs], .95) for i in (1, 2, 3, 4)] if rs else [0] * 4
+    # такт: от отправки на Pi до потока интерфейса телефона (сеть + очередь потока интерфейса); задержан — дольше
+    # половины такта: поток интерфейса был занят, кадр к этому такту начнётся поздно
+    ticks = [t[0] for t in R["desk"]["t"] if pa - 200000 <= t[0] <= pb + 50000]
+    sent = sorted(int(s["sent"]) + off for s in R["ptr"] if s.get("sent") and a <= int(s["sent"]) <= b)
+    delays = []
+    for s_ in sent:
+        j = bisect.bisect_left(ticks, s_ - 3000)
+        if j < len(ticks) and ticks[j] - s_ < 60000:
+            delays.append((ticks[j] - s_, s_))
+    base = pct([d for d, _ in delays], .2) if delays else 0   # сеть: обычная задержка такта
+    stalls = [(d - base, s_) for d, s_ in delays if d - base > P / 2]
+    out["ticks"] = len(sent)
+    out["tick_lost"] = len(sent) - len(delays)
+    out["tick95"] = pct([d / 1000 for d, _ in delays], .95)
+    out["tickmax"] = max((d / 1000 for d, _ in delays), default=0)
+    out["stalls"] = len(stalls)
+    # рывки анимаций: кадры идут по такту, и вдруг разрыв в 2–6 тактов, а после — снова по такту. Причина: такты в
+    # разрыве задержаны (поток интерфейса занят) — «занят»; такты шли вовремя — сцена в них ничего не просила
+    times = [r[0] for r in rs]
+    gaps = [y - x for x, y in zip(times, times[1:])]
+    busy = idle = 0
+    worst = []
+    for i, g in enumerate(gaps):
+        k = round(g / P)
+        # посреди анимации: по 4 ровных шага до и после (иначе — пауза между нажатием и отпусканием, наведением и т. п.)
+        if not (2 <= k <= 6) or i < 4 or i + 4 >= len(gaps):
+            continue
+        if any(round(g_ / P) != 1 for g_ in gaps[i - 4:i] + gaps[i + 1:i + 5]):
+            continue
+        late_ticks = [st for st in stalls if times[i] - 3000 <= st[1] <= times[i + 1]]
+        if late_ticks:
+            busy += k - 1
+        else:
+            idle += k - 1
+        worst.append((g / 1000, times[i], times[i + 1]))
+    out["hitch_busy"], out["hitch_idle"] = busy, idle
+    out["worst"] = sorted(worst, reverse=True)[:3]
+    # самые долгие кадры телефона — что в них сменилось
+    out["slow"] = sorted(((r[1] + r[2] + r[3] + r[4]) / 1000, r[0]) for r in rs)[-3:][::-1]
+    # отклик: от события мыши или клавиши (часы Pi) до первого кадра на мониторе после него (до 0,4 с)
+    # отклик — от того, на что интерфейс отвечает сразу: отпустили кнопку (щелчок срабатывает на отпускание), правая
+    # кнопка, клавиша нажата, колесо
+    ev = [int(r["t"]) for r in R["input"] if a <= int(r["t"]) <= b and
+          (r["kind"] in ("release", "wheel", "right") or (r["kind"] == "key" and r["b"] == "1"))]
+    caps = sorted(((r["capture"] - off), r["shown"]) for r in shown)
+    ct = [c for c, _ in caps]
+    resp = []
+    for e in ev:
+        j = bisect.bisect_right(ct, e)
+        if j < len(caps) and caps[j][1] - e < 400000:
+            resp.append((caps[j][1] - e) / 1000)
+    out["resp50"], out["respmax"], out["resp_n"] = pct(resp, .5), max(resp, default=float("nan")), len(resp)
+    out["misses"] = out["dropped"] + out["late"]
+    # долгие события потока интерфейса (≥ 4 мс): самые долгие, вложенные — с глубиной
+    ev_long = [e for e in R["desk"]["s"] if pa <= e[0] <= pb]
+    out["busy_ms"] = sum(e[1] for e in ev_long if e[3] == 1) / 1000
+    out["long_events"] = sorted(ev_long, key=lambda e: -e[1])[:4]
+    # система
+    S = [s for s in R["sys"] if pa / 1e6 <= s["t"] <= pb / 1e6]
+    if S:
+        mean = lambda v: statistics.mean(v) if v else float("nan")
+        out["cpu"] = mean([sum(s["cpu"]) / 8 for s in S])
+        out["little"] = mean([sum(s["cpu"][:6]) / 6 for s in S])
+        out["big"] = mean([sum(s["cpu"][6:]) / 2 for s in S])
+        out["corepeak"] = max(max(s["cpu"]) for s in S)
+        out["f"] = [mean([s["f"][i] for s in S]) for i in range(3)]
+        out["gpu"] = mean([s["gpu"] for s in S])
+        out["gmhz"] = mean([s["gmhz"] for s in S])
+        out["w"] = mean([s["w"] for s in S])
+        out["skin"] = max(s["temp"].get("skin", 0) for s in S)
+        out["tbig"] = max(s["temp"].get("big", 0) for s in S)
+        procs, threads = {}, {}
+        n = 0
+        for s in S:
+            if "procs" in s:
+                n += 1
+                for c, name, pid, rss in s["procs"]:
+                    procs[name] = procs.get(name, 0) + c
+                for c, name, tid, cpu in s.get("threads", []):
+                    key = f"{name}"
+                    threads.setdefault(key, [0, 0, 0])
+                    threads[key][0] += c
+                    threads[key][1 if cpu < 6 else 2] += 1
+        out["procs"] = sorted(((c / max(1, n), k) for k, c in procs.items()), reverse=True)[:5]
+        out["threads"] = sorted(((v[0] / max(1, n), k, v[1], v[2]) for k, v in threads.items()), reverse=True)[:5]
+        rss = [s["shell_rss"] for s in S if "shell_rss" in s]
+        cool = {}
+        for s_ in S:
+            for k, v in s_.get("cool", {}).items():
+                cool[k] = max(cool.get(k, 0), v)
+        out["cool"] = cool
+        out["temps"] = {k: max(s_["temp"].get(k, 0) for s_ in S) for k in S[-1]["temp"]}
+        out["rss"] = rss[-1] if rss else 0
+        out["memavail"] = min((s["mem_avail"] for s in S if "mem_avail" in s), default=0)
+    return out
+
+
+# рамки, которые есть почти в каждой выборке, — не ответ на «что внутри»
+STACK_SKIP = ("main", "__libc_start", "_start", "QCoreApplication::exec", "QEventLoop::", "QGuiApplication::notify",
+              "QCoreApplication::notifyInternal", "QCoreApplicationPrivate::notify_helper", "ProbedApp::notify",
+              "QObject::event", "QEventDispatcher", "g_main_context", "QCoreApplicationPrivate::sendPostedEvents",
+              "QCoreApplication::sendPostedEvents", "QMetaCallEvent::placeMetaCall", "QQuickWindow::event",
+              "QWindow::event", "QQuickDeliveryAgent", "QGuiApplicationPrivate::process", "?", "[jit]", "QtPrivate::",
+              "QMetaObject::activate", "doActivate", "QQmlBoundSignal", "QQmlJavaScriptExpression::evaluate",
+              "QV4::", "QQmlObjectOrGadget", "QObject::", "QMetaMethod::invoke", "QQmlVMEMetaObject::metaCall")
+
+
+def stacks_in(R, t0, t1):
+    i = bisect.bisect_left(R["stack_t"], t0)
+    j = bisect.bisect_right(R["stack_t"], t1)
+    return [R["stacks"][k][1] for k in range(i, j)]
+
+
+def stack_summary(st, top=6):
+    """что внутри: свои функции (где поток стоял) и охватывающие (без вездесущих рамок), доля выборок"""
+    if not st:
+        return ""
+    own, incl = {}, {}
+    for frames in st:
+        inner = next((f for f in reversed(frames) if not f.startswith(("[jit]", "?"))), frames[-1])
+        own[inner] = own.get(inner, 0) + 1
+        for f in set(frames):
+            if not f.startswith(STACK_SKIP) and not f.startswith("main "):
+                incl[f] = incl.get(f, 0) + 1
+    n = len(st)
+    fmt_ = lambda d: ", ".join(f"{k[:70]} {100 * v // n}%" for k, v in sorted(d.items(), key=lambda kv: -kv[1])[:top])
+    return f"выборок {n}; внутри: {fmt_(incl)} || стоял в: {fmt_(own)}"
+
+
+def first_frames(R):
+    """путь кадра по участкам: первый после паузы (стол стоял ≥ 0,1 с) против кадров движения — где теряется время
+    начала каждой анимации, щелчка, наведения; и сколько их не успело к своему обновлению монитора"""
+    sent_of = {int(r["value"]): int(r["sent"]) for r in R["ptr"] if r.get("value") and r.get("sent")}
+    groups = {"первый": [], "2–4": [], "движение": [], "опорный": []}
+    size = {k: [] for k in groups}
+    miss = {k: 0 for k in groups}
+    prev, idx = None, 0
+    for r in sorted(R["trace"], key=lambda r: r["capture"]):
+        idx = 0 if prev is None or r["capture"] - prev > 100000 else idx + 1
+        prev = r["capture"]
+        t = r.get("target", 0)
+        if t not in sent_of:
+            continue
+        k = "опорный" if r.get("key") else "первый" if idx == 0 else "2–4" if idx < 4 else "движение"
+        sent = sent_of[t] + r["offset"]
+        groups[k].append(((r["capture"] - sent) / 1000, (r["encoded"] - r["capture"]) / 1000,
+                          (r["recv"] - (r["encoded"] - r["offset"])) / 1000, (r["decoded"] - r["recv"]) / 1000,
+                          (r["decoded"] - sent_of[t]) / 1000))
+        if not r["shown"] or r["shown"] - t > R["P"] / 2:
+            miss[k] += 1
+        if r.get("bytes"):
+            size[k].append(r["bytes"] / 1024)
+    out = ["Путь кадра, мс (медиана / 90 %): такт → снят на телефоне | сжат | кабель | распакован на Pi | итого от такта;"
+           " не успели к своему обновлению"]
+    for k, v in groups.items():
+        if v:
+            f = lambda i: f"{pct([x[i] for x in v], .5):4.1f}/{pct([x[i] for x in v], .9):4.1f}"
+            kb = f"; КБ {pct(size[k], .5):.0f}/{pct(size[k], .9):.0f}" if size[k] else ""
+            out.append(f"  {k:9s} {len(v):5d}: {f(0)} | {f(1)} | {f(2)} | {f(3)} | {f(4)};  {miss[k]} ({100 * miss[k] / len(v):.0f} %){kb}")
+    return out + [""]
+
+
+def what_changed(R, t0, t1):
+    """что сменилось в сцене к кадрам между t0 и t1 (строки d трассы) — подсказка, кто рисовал"""
+    seen = {}
+    for t, items in R["desk"]["d"]:
+        if t0 <= t <= t1:
+            for it in items.split(";"):
+                name = it.split("=")[0]
+                if name:
+                    seen[name] = seen.get(name, 0) + 1
+    return sorted(seen.items(), key=lambda kv: -kv[1])[:4]
+
+
+def fmt(v, d=0):
+    return "—" if v != v else f"{v:.{d}f}"
+
+
+def analyze(folder):
+    R = load_run(folder)
+    P = R["P"]
+    lines = [f"Прогон стола {os.path.basename(folder)}: монитор {R['hz']:.2f} Гц (такт {P / 1000:.2f} мс), "
+             f"сдвиг часов телефон−Pi {R['off'] / 1e6:.3f} с, шагов {len(R['steps'])}", ""]
+    lines += first_frames(R)
+    lines.append("Шаг                          | сек | кадров тел/мон | пропуски мон | рывки анимаций | кадр тел мс     | такт→UI мс    | отклик мс | до экрана | ЦП % мал/бол | ГП %  МГц | Вт  | °C   | RSS")
+    lines.append("                             |     |                | выбр+опозд   | занят/не прос. | 50 / 95 / max   | 95/max (задер)| 50 / max  | мс 50     |              |           |     |      | МБ")
+    summary = {}
+    for name, a, b in R["steps"]:
+        s = analyze_span(R, a, b)
+        summary[name] = {k: v for k, v in s.items() if k not in ("worst", "procs", "threads", "slow")}
+        nan = float("nan")
+        lines.append(
+            f"{name[:28]:<28} | {s['sec']:3.1f} | {s['renders']:4d}/{s['frames']:<4d}     | {s['dropped']:3d}+{s['late']:<3d}      |"
+            f" {s['hitch_busy']:3d} / {s['hitch_idle']:<3d}      | {fmt(s['work50'], 1):>4}/{fmt(s['work95'], 1):>4}/{fmt(s['workmax'], 0):>3}  "
+            f"   | {fmt(s['tick95'], 1):>4}/{fmt(s['tickmax'], 0):>3} ({s['stalls']:2d}) | {fmt(s['resp50']):>3}/{fmt(s['respmax']):>4}  "
+            f"| {fmt(s['lat50']):>4}      | {fmt(s.get('little', nan)):>3}/{fmt(s.get('big', nan)):>3}      "
+            f"| {fmt(s.get('gpu', nan)):>3} {fmt(s.get('gmhz', nan)):>4}  | {fmt(s.get('w', nan), 1)} | {fmt(s.get('skin', nan), 1)} | {s.get('rss', 0)}")
+    lines.append("")
+    lines.append("Подробно по шагам (худшие шаги кадров телефона, кто ел процессор, потоки оболочки — %, малые/большие ядра):")
+    for name, a, b in R["steps"]:
+        s = analyze_span(R, a, b)
+        bad = s["hitch_busy"] + s["misses"] + s["stalls"]
+        detail = []
+        for gap, t0, t1 in s["worst"]:
+            ch = what_changed(R, t0, t1)
+            detail.append(f"разрыв {gap:.0f} мс" + (" (сменилось: " + ", ".join(f"{n}×{c}" for n, c in ch) + ")" if ch else ""))
+        slow = []
+        for ms, t0 in s["slow"]:
+            if ms >= 6:
+                ch = what_changed(R, t0 - 1, t0 + 1)
+                slow.append(f"{ms:.1f} мс" + (" (" + ", ".join(f"{n}" for n, c in ch[:3]) + ")" if ch else ""))
+        procs = ", ".join(f"{n} {c:.0f}" for c, n in s.get("procs", []))
+        thr = ", ".join(f"{n} {c:.0f} ({l}/{bg})" for c, n, l, bg in s.get("threads", []))
+        lines.append(f"• {name}: {'ПЛОХО: ' if bad else ''}задержка до экрана {fmt(s['lat50'])}/{fmt(s['lat95'])} мс; "
+                     f"части кадра 95% (polish/sync/render/end) {'/'.join(fmt(x, 1) for x in s['parts95'])} мс; "
+                     f"частоты мал/б/б+ {'/'.join(fmt(x) for x in s.get('f', [])) or '—'} МГц; ядро до {s.get('corepeak', '—')}%")
+        if s.get("cool"):
+            lines.append("    ограничители по нагреву (ступень): " + ", ".join(f"{k} {v}" for k, v in sorted(s["cool"].items()))
+                         + "; датчики, °C: " + ", ".join(f"{k} {v:.1f}" for k, v in sorted(s.get("temps", {}).items())))
+        if s.get("page", 0) >= 5:
+            lines.append(f"    кадры браузера: {s['page']} ({s['page_fps']:.1f}/с), шаг 95 % {s['page_gap95']:.1f} мс, "
+                         f"разрывов длиннее 42 мс: {s['page_long']}")
+        if s.get("app", 0) >= 5:
+            lines.append(f"    кадры Android: {s['app']} ({s['app_fps']:.1f}/с), шаг 95 % {s['app_gap95']:.1f} мс, "
+                         f"разрывов длиннее 2,5 такта: {s['app_long']}")
+        if detail:
+            lines.append("    рывки: " + "; ".join(detail))
+        if slow:
+            lines.append("    долгие кадры: " + "; ".join(slow))
+        if s["long_events"]:
+            outer = [e for e in s["long_events"] if e[3] == 1]
+            q = sum(e[6] for e in outer if e[6] > 0) / 1000
+            run = sum(e[2] for e in outer) / 1000
+            if R["stacks"]:
+                for e in sorted(outer, key=lambda e: -e[1])[:2]:
+                    if e[1] >= 12000:
+                        lines.append(f"    в событии {e[1] / 1000:.0f} мс ({e[4]}): " + stack_summary(stacks_in(R, e[0], e[0] + e[1])))
+            lines.append(f"    поток интерфейса занят событиями ≥ 4 мс: {s['busy_ms']:.0f} мс (самые долгие: на ядре {run:.0f}, "
+                         f"ждал ядро {q:.0f}, спал {max(0, sum(e[1] for e in outer) / 1000 - run - q):.0f}); " + "; ".join(
+                f"{e[1] / 1000:.0f} мс (ЦП {e[2] / 1000:.0f}" + (f", очередь {e[6] / 1000:.0f}" if e[6] > 0 else "")
+                + f", ядро {e[7]}) {e[4]}→{e[5][:70]}" + (f" [вложено {e[3]}]" if e[3] > 1 else "")
+                for e in s["long_events"]))
+        if procs:
+            lines.append("    процессы: " + procs)
+        if thr:
+            lines.append("    потоки оболочки: " + thr)
+    # журнал оболочки — ошибки QML и предупреждения за прогон
+    log = open(os.path.join(folder, "shell.log"), errors="replace").read().splitlines()
+    warn = [l for l in log if any(w in l for w in ("TypeError", "ReferenceError", "Binding loop", "warning", "Warning",
+                                                     "Error", "не удалось", "не открыть"))]
+    if warn:
+        lines.append("")
+        lines.append(f"Журнал оболочки: предупреждений и ошибок {len(warn)} (первые 12):")
+        seen = set()
+        for l in warn:
+            key = l.split(": ", 1)[-1][:120]
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append("    " + l[-200:])
+            if len(seen) >= 12:
+                break
+    # пробный приёмник гасят SIGINT в конце прогона: чистый выход — строка «выход» и после неё ничего о падении
+    # (20 ноября «terminate called» после «выход» нашли в двух отчётах случайно — docs/PI.md, «Выход приёмника»)
+    dock = open(os.path.join(folder, "dock.log"), errors="replace").read().splitlines()
+    after = dock[dock.index("выход") + 1:] if "выход" in dock else None
+    bad = [l for l in after or [] if any(w in l for w in ("terminate called", "Aborted", "Segmentation", "core dumped"))]
+    if after is None or bad:
+        lines.append("")
+        lines.append("Приставка: пробный приёмник вышел не чисто — " + ("в журнале нет «выход» (не дошёл до выхода)"
+                     if after is None else "после «выход»: " + " / ".join(bad[:3])))
+    notes = open(os.path.join(folder, "notes.txt")).read().strip() if os.path.exists(os.path.join(folder, "notes.txt")) else ""
+    if notes:
+        lines.append("")
+        lines.append("Заметки сценария:\n" + notes)
+    json.dump(summary, open(os.path.join(folder, "summary.json"), "w"), ensure_ascii=False, indent=1)
+    text = "\n".join(lines)
+    open(os.path.join(folder, "report.txt"), "w").write(text + "\n")
+    return text
+
+
+def compare(a, b):
+    A = json.load(open(os.path.join(a, "summary.json")))
+    B = json.load(open(os.path.join(b, "summary.json")))
+    keys = [("misses", "пропуски мон"), ("hitch_busy", "рывки занят"), ("hitch_idle", "не просила"),
+            ("work95", "кадр 95%"), ("stalls", "такт задерж"), ("resp50", "отклик"), ("lat50", "до экрана"),
+            ("cpu", "ЦП %"), ("w", "Вт")]
+    print(f"{'шаг':<28} " + " ".join(f"{h:>14}" for _, h in keys))
+    for name in A:
+        if name not in B:
+            continue
+        cells = []
+        for k, _ in keys:
+            x, y = A[name].get(k, float("nan")), B[name].get(k, float("nan"))
+            cells.append(f"{fmt(x, 1):>6}→{fmt(y, 1):<6}")
+        print(f"{name[:28]:<28} " + " ".join(f"{c:>14}" for c in cells))
+
+
+def show_scene(words):
+    sc = scene()
+    print(f"стол {sc.w}×{sc.h}, элементов {len(sc.items)}")
+    for i in sc.items:
+        s = json.dumps(i, ensure_ascii=False)
+        if not words or any(w in s for w in words):
+            print(s)
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "help"
+    if cmd == "run":
+        names = args[1:] or ORDER
+        bad = [n for n in names if n not in STEPS]
+        if bad:
+            sys.exit(f"нет шагов {bad}; есть: {' '.join(STEPS)}")
+        run(names)
+    elif cmd == "list":
+        print("по порядку: " + " ".join(ORDER))
+        print("отдельно: " + " ".join(n for n in STEPS if n not in ORDER))
+    elif cmd == "again":
+        for f in args[1:]:
+            print(analyze(f))
+    elif cmd == "compare":
+        compare(args[1], args[2])
+    elif cmd == "scene":
+        show_scene(args[1:])
+    elif cmd == "history" and args[1:] in (["save"], ["restore"]):
+        history(args[1])
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

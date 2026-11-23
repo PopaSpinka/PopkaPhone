@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Служба телевизора (TvService, docs/TV.md): только клавиши пульта (выбранная кнопка открывает приложение);
+     событий окон не получает, содержимое экрана не читает -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRequestFilterKeyEvents"
+    android:canRequestFilterKeyEvents="true"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/tv_service_about"
+    android:notificationTimeout="0" />

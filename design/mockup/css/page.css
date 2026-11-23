@@ -1,0 +1,80 @@
+/* Страница вокруг телефона: стенд и пульт. Нейтрали слегка тонированы цветом-источником (--hue ставит js/panel.js). */
+:root {
+  --hue: 60;
+  --pg-bg: oklch(0.955 0.007 var(--hue));
+  --pg-fg: oklch(0.23 0.012 var(--hue));
+  --pg-muted: oklch(0.48 0.016 var(--hue));
+  --pg-line: oklch(0.87 0.01 var(--hue));
+  --pg-card: oklch(0.985 0.004 var(--hue));
+  --pg-chip: oklch(0.92 0.012 var(--hue));
+  --pg-accent: oklch(0.5 0.11 var(--hue));
+  --pg-accent-fg: oklch(0.99 0.01 var(--hue));
+  --pg-font: 'Google Sans', 'Roboto Flex', system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --pg-bg: oklch(0.17 0.008 var(--hue)); --pg-fg: oklch(0.93 0.008 var(--hue)); --pg-muted: oklch(0.7 0.014 var(--hue));
+    --pg-line: oklch(0.3 0.01 var(--hue)); --pg-card: oklch(0.21 0.009 var(--hue)); --pg-chip: oklch(0.28 0.012 var(--hue));
+    --pg-accent: oklch(0.8 0.1 var(--hue)); --pg-accent-fg: oklch(0.2 0.04 var(--hue)); color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --pg-bg: oklch(0.17 0.008 var(--hue)); --pg-fg: oklch(0.93 0.008 var(--hue)); --pg-muted: oklch(0.7 0.014 var(--hue));
+  --pg-line: oklch(0.3 0.01 var(--hue)); --pg-card: oklch(0.21 0.009 var(--hue)); --pg-chip: oklch(0.28 0.012 var(--hue));
+  --pg-accent: oklch(0.8 0.1 var(--hue)); --pg-accent-fg: oklch(0.2 0.04 var(--hue)); color-scheme: dark;
+}
+html, body { height: 100%; }
+body { background: var(--pg-bg); color: var(--pg-fg); font-family: var(--pg-font); font-size: 14px; }
+
+.app { display: flex; height: 100%; gap: 28px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); box-sizing: border-box; }
+.stage { flex: 1; min-width: 0; display: flex; align-items: center; justify-content: center; padding-block: 14px; }
+.panel { width: 410px; flex: none; overflow-y: auto; padding-block: 18px 28px; display: flex; flex-direction: column; gap: 14px; scrollbar-width: thin; }
+
+.p-head h1 { font-size: 24px; line-height: 30px; font-weight: 500; margin: 0; text-wrap: balance; }
+.p-head p { margin: 6px 0 0; color: var(--pg-muted); line-height: 20px; max-width: 60ch; }
+.p-src { margin-top: 8px; font-size: 12px; color: var(--pg-muted); display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.p-src b { font-weight: 500; color: var(--pg-fg); }
+.p-card { background: var(--pg-card); border: 1px solid var(--pg-line); border-radius: 16px; padding: 14px 14px 12px; display: flex; flex-direction: column; gap: 12px; }
+.p-card h2 { font-size: 13px; font-weight: 500; letter-spacing: .6px; text-transform: uppercase; color: var(--pg-muted); margin: 0; }
+.p-row { display: flex; flex-direction: column; gap: 6px; }
+.p-row-top { display: flex; align-items: center; gap: 8px; }
+.p-label { font-size: 14px; font-weight: 500; flex: 1; }
+.p-note { font-size: 12px; color: var(--pg-muted); line-height: 16px; }
+.seg { display: flex; flex-wrap: wrap; gap: 4px; }
+.seg button, .p-btn { font: inherit; font-size: 13px; color: var(--pg-fg); background: var(--pg-chip); border: 0; border-radius: 9px; padding: 6px 10px; cursor: pointer; line-height: 18px;
+  transition: background-color 120ms, color 120ms, border-radius 200ms; }
+.seg button:hover, .p-btn:hover { filter: brightness(1.04); }
+.seg button.on { background: var(--pg-accent); color: var(--pg-accent-fg); border-radius: 14px; }
+.seg button:focus-visible, .p-btn:focus-visible, .p-play:focus-visible { outline: 2px solid var(--pg-accent); outline-offset: 2px; }
+.p-play { font: inherit; font-size: 12px; font-weight: 500; border: 1px solid var(--pg-line); background: transparent; color: var(--pg-fg); border-radius: 999px; padding: 3px 10px 3px 8px; cursor: pointer; display: inline-flex; gap: 4px; align-items: center; }
+.p-play:hover { border-color: var(--pg-accent); color: var(--pg-accent); }
+.p-play svg { width: 10px; height: 10px; }
+.p-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+.p-btn.wide { flex: 1 1 auto; text-align: center; }
+.p-sys { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; }
+.p-sys .p-btn { padding: 8px 0; text-align: center; }
+.swatches { display: flex; flex-wrap: wrap; gap: 8px; }
+.swatches button { width: 28px; height: 28px; border-radius: 14px; border: 0; cursor: pointer; transition: border-radius 200ms; }
+.swatches button.on { border-radius: 8px; box-shadow: 0 0 0 2px var(--pg-card), 0 0 0 4px var(--pg-accent); }
+.wps { display: flex; gap: 8px; }
+.wps button { width: 44px; height: 92px; border-radius: 10px; border: 0; cursor: pointer; background-size: cover; background-position: center; transition: border-radius 200ms; }
+.wps button.on { border-radius: 16px; box-shadow: 0 0 0 2px var(--pg-card), 0 0 0 4px var(--pg-accent); }
+.shapes { display: flex; gap: 6px; flex-wrap: wrap; }
+.shapes button { width: 40px; height: 40px; border-radius: 10px; border: 0; background: var(--pg-chip); display: grid; place-items: center; cursor: pointer; }
+.shapes button i { display: block; width: 26px; height: 26px; background: var(--pg-muted); }
+.shapes button.on { background: var(--pg-accent); }
+.shapes button.on i { background: var(--pg-accent-fg); }
+.choice { font-size: 13px; line-height: 20px; background: var(--pg-chip); border-radius: 10px; padding: 10px 12px; white-space: pre-wrap; word-break: break-word; }
+.gest { margin: 0; padding: 0; list-style: none; display: grid; gap: 7px; }
+.gest li { display: grid; grid-template-columns: 112px 1fr; gap: 10px; line-height: 18px; }
+.gest b { font-weight: 500; }
+.gest span { color: var(--pg-muted); }
+.spec { font-size: 12px; color: var(--pg-muted); font-variant-numeric: tabular-nums; line-height: 17px; }
+.kbd { font-size: 11px; border: 1px solid var(--pg-line); border-bottom-width: 2px; border-radius: 5px; padding: 0 5px; color: var(--pg-muted); }
+
+@media (max-width: 900px) {
+  .app { flex-direction: column; height: auto; gap: 8px; }
+  .panel { width: auto; overflow: visible; padding-block: 0 24px; }
+  .stage { padding-block: 10px 4px; }
+}
+@media (prefers-reduced-motion: reduce) { .seg button, .swatches button, .wps button { transition: none; } }
